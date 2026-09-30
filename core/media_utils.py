@@ -7,6 +7,7 @@
 import os
 import asyncio
 import hashlib
+import shutil
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -272,6 +273,127 @@ async def merge_av(
         raise
     await asyncio.gather(safe_unlink(v_path), safe_unlink(a_path))
     logger.info(f"Merged {output_path.name}, {fmt_size(output_path)}")
+
+
+# AstrBot 框架的「QQ 官方 Bot 分片上传阈值」：`QQOFFICIAL_CHUNKED_UPLOAD_THRESHOLD`
+# （qqofficial_chunked_upload.py，4.28.x 为 10MB）。超过它走分片上传（预签名 URL + 5MB
+# 分片 + 4 路并发，单请求超时 300s），不超过则是**单次 base64 POST 到 API 主机、
+# 客户端超时只有 20s**（qqofficial_platform_adapter.py 的 BotHttp(timeout=20)）——
+# 慢上行下这个请求必然超时，botpy 超时后 `return None`，框架把它当成
+# 「上传文件API返回None」重试 5 次（约 2 分钟）后放弃。
+#
+# QQ 官方文档明确说本地文件**推荐分片上传**，所以下面这个补位函数是把「本来就该走
+# 分片」的小文件送回分片的轨道上。
+QQ_CHUNKED_UPLOAD_THRESHOLD_BYTES = 10 * 1024 * 1024
+
+# 补到「阈值 + 这么多字节」，保证严格大于阈值（框架用的是 `>`）
+_QQ_PAD_EXTRA_BYTES = 64 * 1024
+
+
+def should_pad_for_chunked(
+    size_bytes: int,
+    *,
+    pad_min_mb: int,
+    single_shot_broken: bool,
+    threshold: int = QQ_CHUNKED_UPLOAD_THRESHOLD_BYTES,
+) -> bool:
+    """这个文件要不要补到分片阈值（纯判定，与 I/O 分开以便直接断言）。
+
+    三种情况补：
+    * 体积超过手动设的「分片上传起点」（用户在按自己的上行带宽取舍）；
+    * 本机已经被证明**单次 base64 上传不可靠**（见 main.py 的记忆文件），
+      那么此后所有不超过阈值的文件都直接走分片，不必每次白等两分钟重试；
+    * 其余（含超过阈值的）不补 —— 超过阈值的本来就走分片。
+    """
+    if size_bytes <= 0 or size_bytes > threshold:
+        return False
+    if single_shot_broken:
+        return True
+    return pad_min_mb > 0 and size_bytes >= pad_min_mb * 1024 * 1024
+
+
+async def pad_to_chunked_upload(src: Path, *, threshold: int = QQ_CHUNKED_UPLOAD_THRESHOLD_BYTES) -> Path:
+    """把不超过 ``threshold`` 的视频补到略高于它，让 QQ 官方 Bot 走**分片上传**。
+
+    补的是一个**尾部 ``free`` box**（ISO/IEC 14496-12 里 `free` 就是「可跳过的空闲
+    区」）：
+
+    * 放在文件**末尾**是关键 —— 它不移动任何已有字节，``moov`` 里的绝对偏移
+      (``stco``/``co64``) 全部保持有效，播放器与 QQ 的校验都不受影响；
+    * 反过来，把填充插在 ``ftyp`` 之后会平移 ``mdat``，必须同步修补 ``stco``，
+      修错一点整段视频就废了 —— 所以这里只在尾部追加。
+
+    顺便说明为什么值得补：单次 base64 的 20s 超时是**按请求**算的，分片上传的
+    每个请求都很小、且有 300s 预算，于是「总时长受带宽限制」不再等于「必然超时」。
+
+    返回补位后的文件路径；原文件大于阈值时原样返回。补位失败时也原样返回
+    （宁可走老路径，也不让发送直接失败）。
+    """
+    try:
+        size = src.stat().st_size
+    except OSError:
+        return src
+    if size > threshold:
+        return src
+
+    padded = src.with_name(f"{src.stem}.qqchunk{src.suffix}")
+    try:
+        if padded.exists() and padded.stat().st_size > threshold:
+            return padded  # 已经补过：同一条链接重复发送时不必再拷一遍
+
+        # 大文件拷贝走线程，别堵事件循环（≤10MB，几十毫秒级）
+        await asyncio.to_thread(shutil.copyfile, src, padded)
+        missing = threshold + _QQ_PAD_EXTRA_BYTES - size
+        # box：4 字节大端长度（含 8 字节头）+ 类型 + 载荷
+        box = int(missing).to_bytes(4, "big") + b"free" + b"\x00" * (missing - 8)
+        with padded.open("ab") as fh:
+            fh.write(box)
+    except Exception:
+        logger.warning(
+            f"补位到分片上传阈值失败，改用原文件发送: {src.name}", exc_info=True
+        )
+        return src
+
+    logger.info(
+        f"已补位到分片上传阈值（{size / 1024 / 1024:.1f}MB → "
+        f"{padded.stat().st_size / 1024 / 1024:.1f}MB）: {padded.name}"
+    )
+    return padded
+
+
+async def remux_ts_to_mp4(src: Path, dst: Path) -> None:
+    """把 m3u8 拼接出来的 TS / fMP4 裸流重封装成规范的 MP4（**零转码**）。
+
+    为什么必须做：m3u8 分片直接拼接得到的文件只是个字节串，扩展名写成 ``.mp4``
+    并不会让它变成 MP4。播放器只能靠嗅探硬猜，猜不准就把时长和预览尺寸显示错，
+    电脑版 QQ 干脆拒绝播放。``-c copy`` 只重写容器，不解码重编码，代价近乎为零；
+    ``+faststart`` 把 moov 盒挪到文件头，边下边播的预览才能立刻拿到元数据。
+
+    失败时删掉残缺输出再向上抛（形状与 :func:`merge_av` 一致），
+    由调用方决定是否回退。
+    """
+    logger.info(f"Remuxing {src.name} -> {dst.name}")
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(src),
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+
+    try:
+        await exec_ffmpeg_cmd(cmd)
+    except BaseException:
+        # 同 merge_av：捕 BaseException，取消时也要清掉残缺输出，
+        # 否则半截 .remux.mp4 会被下游的 exists() 当成成品。
+        await safe_unlink(dst)
+        raise
+    logger.info(f"Remuxed {dst.name}, {fmt_size(dst)}")
 
 
 async def encode_video_to_h264(video_path: Path) -> Path:

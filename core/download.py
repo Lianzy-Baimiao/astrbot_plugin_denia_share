@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from uuid import uuid4
 from pathlib import Path
 from functools import partial
@@ -12,10 +13,10 @@ import httpx
 import aiofiles
 from astrbot.api import logger
 
-from .media_utils import merge_av, safe_unlink, generate_file_name
+from .media_utils import merge_av, remux_ts_to_mp4, safe_unlink, generate_file_name
 from .media_verify import HEAD_PROBE_BYTES, classify_media_response, sniff_image_ext
 from .constants import COMMON_HEADER, DOWNLOAD_TIMEOUT
-from .exception import IgnoreException, DownloadException
+from .exception import IgnoreException, DownloadException, MediaProcessException
 
 # 图片并发上限。
 #
@@ -37,6 +38,16 @@ MAX_CONCURRENT_MEDIA_DOWNLOADS = 3
 # m3u8 分片数上限：字节上限之外再兜一层，防止「超多超小分片」把循环拖死
 MAX_M3U8_SEGMENTS = 3000
 
+# m3u8 主播放列表（master playlist）递归解析的最大层数。
+# 正常情况下最多两层（master → 变体 → 分片），给足余量并防住「变体指向自己」
+# 这类畸形清单把递归拖成死循环。
+MAX_M3U8_PLAYLIST_DEPTH = 3
+
+# ``#EXT-X-MAP:URI="..."`` 里取 URI 的值（带引号或不带引号都收）
+_M3U8_URI_RE = re.compile(r'URI=(?:"([^"]+)"|([^,\s]+))', re.IGNORECASE)
+_M3U8_RESOLUTION_RE = re.compile(r"RESOLUTION=(\d+)x(\d+)", re.IGNORECASE)
+_M3U8_BANDWIDTH_RE = re.compile(r"(?:AVERAGE-)?BANDWIDTH=(\d+)", re.IGNORECASE)
+
 # ============================ 独立于配置的硬上限 ============================
 #
 # 配置项 ``MAX_SIZE_MB`` 是**用户可控**的（能填到 4GB，也能填 0 = 不限制），
@@ -48,6 +59,62 @@ MAX_M3U8_SEGMENTS = 3000
 # 没有理由超过 2GB，单张图片没有理由超过 64MB。
 HARD_MAX_MEDIA_BYTES = 2 * 1024 * 1024 * 1024  # 视频 / 音频 2GB
 HARD_MAX_IMAGE_BYTES = 64 * 1024 * 1024  # 图片 64MB
+
+
+def _m3u8_attr(line: str, pattern: re.Pattern[str]) -> str | None:
+    """从 ``#EXT-X-...`` 标签行里取属性值（带引号 / 不带引号都支持）。"""
+    match = pattern.search(line)
+    if not match:
+        return None
+    return match.group(1) or match.group(2)
+
+
+def _parse_m3u8_text(text: str, base_url: str) -> tuple[str | None, list[str], list[str]]:
+    """解析一份 m3u8，返回 ``(init segment URL, 分片 URL 列表, 子清单 URL 列表)``。
+
+    三种清单形态都要认：
+    - **分片清单**：非 ``#`` 行就是分片；
+    - **主播放列表**（master playlist）：``#EXT-X-STREAM-INF`` 后面跟的第一条
+      非 ``#`` 行是**子清单**，不是分片 —— 当成分片下会把一堆 m3u8 文本拼进视频；
+    - **fMP4 清单**：``#EXT-X-MAP`` 给出 init segment（moov 盒），它必须排在所有
+      分片之前，缺了它整段流就是「没有头的片段」，播放器只能靠猜。
+    """
+    init_seg: str | None = None
+    segments: list[str] = []
+    variants: list[tuple[int, int, str]] = []
+    pending_stream_inf: str | None = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            upper = line.upper()
+            if upper.startswith("#EXT-X-MAP"):
+                uri = _m3u8_attr(line, _M3U8_URI_RE)
+                if uri:
+                    init_seg = urljoin(base_url, uri)
+            elif upper.startswith("#EXT-X-STREAM-INF"):
+                pending_stream_inf = line
+            continue
+
+        if pending_stream_inf is not None:
+            # 主播放列表：这一行是子清单地址，按 分辨率 → 带宽 取最高的一路
+            resolution = _M3U8_RESOLUTION_RE.search(pending_stream_inf)
+            bandwidth = _M3U8_BANDWIDTH_RE.search(pending_stream_inf)
+            pixels = (
+                int(resolution.group(1)) * int(resolution.group(2)) if resolution else 0
+            )
+            variants.append(
+                (pixels, int(bandwidth.group(1)) if bandwidth else 0, urljoin(base_url, line))
+            )
+            pending_stream_inf = None
+            continue
+
+        segments.append(urljoin(base_url, line))
+
+    best = [url for _, _, url in sorted(variants, reverse=True)] if variants else []
+    return init_seg, segments, best
 
 
 class StreamDownloader:
@@ -428,17 +495,29 @@ class StreamDownloader:
         # 避免「文件还没落盘但槽已释放」。
         async with self._media_slots:
             try:
-                # 1. 获取并解析 m3u8 分片列表
-                response = await self.client.get(m3u8_url, headers=headers)
-                response.raise_for_status()
-                slices_text = response.text
-
+                # 1. 获取并解析 m3u8。主播放列表先递归取分辨率最高的变体，
+                #    init segment（#EXT-X-MAP）要作为拼接的第一段 —— 缺了它拼出来的
+                #    就是没有 moov 的裸流，播放器按体积猜时长就会猜错（预览大小不对）。
+                playlist_url = m3u8_url
+                seen_playlists: set[str] = set()
+                init_seg_url: str | None = None
                 slices: list[str] = []
-                for line in slices_text.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
+                for _ in range(MAX_M3U8_PLAYLIST_DEPTH):
+                    seen_playlists.add(playlist_url)
+                    response = await self.client.get(playlist_url, headers=headers)
+                    response.raise_for_status()
+                    init, segments, variants = _parse_m3u8_text(
+                        response.text, playlist_url
+                    )
+                    if variants and not segments:
+                        # 主播放列表：换到清晰度最高的一路，下一轮再解析
+                        if variants[0] in seen_playlists:
+                            raise DownloadException("m3u8 子清单指向自身，无法解析")
+                        playlist_url = variants[0]
                         continue
-                    slices.append(urljoin(m3u8_url, line))
+                    slices = segments
+                    init_seg_url = init
+                    break
 
                 if not slices:
                     raise DownloadException("m3u8 分片列表为空")
@@ -455,24 +534,38 @@ class StreamDownloader:
                 # _validate_content_length / _validate_downloaded_bytes，
                 # 只判 Content-Length 的话 VIDEO_SIZE_MAXIMUM_MB 在 m3u8 上完全失效。
                 received_bytes = 0
+
+                async def _append_stream(f, url: str, received: int) -> int:
+                    """流式追加一个 URL 的字节，返回累计字节数（超限直接抛）。"""
+                    async with self.client.stream("GET", url, headers=headers) as response:
+                        response.raise_for_status()
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
+                            if not chunk:
+                                continue
+                            await f.write(chunk)
+                            received += len(chunk)
+                            if self._max_bytes and received > self._max_bytes:
+                                mb = received / 1024 / 1024
+                                logger.warning(
+                                    f"m3u8 视频下载到 {mb:.1f}MB 超过上限 "
+                                    f"{self.max_size_mb}MB，中断: {m3u8_url}"
+                                )
+                                raise IgnoreException(
+                                    f"媒体大小超过上限({self.max_size_mb}MB)"
+                                )
+                    return received
+
+                # init segment（如果有）必须写在所有分片之前：它是 fMP4 的
+                # moov 盒，排在后面等于没有。
                 async with aiofiles.open(part, "wb") as f:
+                    if init_seg_url:
+                        received_bytes = await _append_stream(
+                            f, init_seg_url, received_bytes
+                        )
                     for seg_url in slices:
-                        async with self.client.stream("GET", seg_url, headers=headers) as response:
-                            response.raise_for_status()
-                            async for chunk in response.aiter_bytes(chunk_size=1024 * 1024):
-                                if not chunk:
-                                    continue
-                                await f.write(chunk)
-                                received_bytes += len(chunk)
-                                if self._max_bytes and received_bytes > self._max_bytes:
-                                    mb = received_bytes / 1024 / 1024
-                                    logger.warning(
-                                        f"m3u8 视频下载到 {mb:.1f}MB 超过上限 "
-                                        f"{self.max_size_mb}MB，中断: {m3u8_url}"
-                                    )
-                                    raise IgnoreException(
-                                        f"媒体大小超过上限({self.max_size_mb}MB)"
-                                    )
+                        received_bytes = await _append_stream(
+                            f, seg_url, received_bytes
+                        )
 
             except BaseException as exc:
                 # 半截 .part 必须无条件删掉，所以这里**必须写 BaseException**：
@@ -500,7 +593,38 @@ class StreamDownloader:
                     logger.warning(f"m3u8 视频下载异常 | url: {m3u8_url}", exc_info=True)
                 raise DownloadException("m3u8 视频下载失败")
 
-            os.replace(part, video_path)
+            # 3. 封装。裸拼 TS 分片冒充 .mp4 是个容器残缺的文件：能播的播放器靠
+            #    硬猜，猜不准就把时长/预览尺寸显示错，电脑版 QQ 更是直接不认。
+            #    用 ffmpeg -c copy 重封装成真正的 MP4（零转码，只重写容器 + faststart）。
+            #    ffmpeg 缺失或失败时都退回裸拼接文件 —— 不能让「环境没装 ffmpeg」
+            #    把 AcFun 这类只有 m3u8 的平台整条搞挂。
+            final_part = part
+            remuxed = part.with_suffix(".remux.mp4")
+            try:
+                try:
+                    await remux_ts_to_mp4(part, remuxed)
+                except MediaProcessException:
+                    logger.warning(
+                        f"未找到 ffmpeg，m3u8 视频将按裸拼接发送（容器可能不规范）: {m3u8_url}"
+                    )
+                except Exception:
+                    logger.warning(
+                        f"m3u8 重封装失败，回退为裸拼接文件: {m3u8_url}", exc_info=True
+                    )
+                else:
+                    final_part = remuxed
+
+                os.replace(final_part, video_path)
+            except BaseException:
+                # 这一段在「半截 .part 清理」的 except 之外，所以必须自己兜一次：
+                # 重封装是 await（取消点），os.replace 也可能失败，两条路都会让
+                # .part / .remux.mp4 留在缓存目录里 —— 与上面那条规矩同源，
+                # 而且 CancelledError 不是 Exception，不写 BaseException 就漏掉了。
+                await safe_unlink(part)
+                await safe_unlink(remuxed)
+                raise
+            if final_part != part:
+                await safe_unlink(part)
         return video_path
 
     async def download_audio(

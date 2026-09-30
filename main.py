@@ -32,9 +32,12 @@ from astrbot.api.star import Context, Star, register, StarTools
 
 from .core.media_utils import (
     CACHE_MARKER_NAME,
+    QQ_CHUNKED_UPLOAD_THRESHOLD_BYTES,
     cleanup_cache_dir,
     ensure_cache_marker,
     is_docker_environment,
+    pad_to_chunked_upload,
+    should_pad_for_chunked,
 )
 from .core.config import init_config, get_config, verify_schema_alignment
 from .core.download import StreamDownloader
@@ -43,7 +46,8 @@ from .core.data import (
 )
 from .core.history import HistoryStore, ParseRecord
 from .core.permissions import is_allowed
-from .core.relay import register_file
+from .core.send_mode import pick_items, split_nodes
+from .core.relay import register_file, resolve_callback_base
 from .core.constants import (
     PLATFORM_DISPLAY_NAMES, PlatformEnum, is_custom_platform, platform_meta,
 )
@@ -140,6 +144,35 @@ class DeniaSharePlugin(Star):
             return "aiocqhttp" in event.get_platform_name().lower()
         except Exception:
             return False
+
+    @staticmethod
+    def _is_qq_official(event: AstrMessageEvent) -> bool:
+        """是否 QQ 官方 Bot（``qq_official`` / ``qqofficial_webhook`` 两种注册名）。
+
+        官方适配器会**丢弃** ``Comp.Nodes``（合并转发），所以文本只能走普通消息；
+        富媒体则相反 —— 它支持本地文件上传视频，但不能像 aiocqhttp 那样读容器路径。
+        """
+        try:
+            return "qqofficial" in event.get_platform_name().lower().replace("_", "")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _platform_name(event: AstrMessageEvent) -> str:
+        """平台类型名（``aiocqhttp`` / ``qq_official``），取不到返回空串。
+
+        AstrBot 的 ``get_platform_name()`` 返回的是**适配器类型**而不是实例名
+        （实例名在 ``get_platform_id()``），所以它可以直接当发送模式覆盖表的键。
+        """
+        try:
+            return str(event.get_platform_name() or "")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_media_item(item: list) -> bool:
+        """该节点条目是不是媒体（图片）—— 供 ``split_nodes`` 切分文字 / 媒体。"""
+        return any(isinstance(comp, Comp.Image) for comp in item)
 
     @staticmethod
     def _fallback_cache_dir(data_dir: Path) -> tuple[Path, str]:
@@ -292,6 +325,9 @@ class DeniaSharePlugin(Star):
         self._bili_data_dir = StarTools.get_data_dir(PLUGIN_NAME)
         self._bili_data_dir.mkdir(parents=True, exist_ok=True)
         self._bili_cookie_file = self._bili_data_dir / "bili_cookie.json"
+        # 「本机单次 base64 上传不可靠」的记忆（QQ 官方 Bot 专用，见 _send_official_video）
+        self._official_upload_file = self._bili_data_dir / "official_upload.json"
+        self._official_single_shot_broken = self._load_official_single_shot_broken()
 
         # ========== 解析记录（WebUI「缓存」页的数据源） ==========
         self.history = HistoryStore(data_dir / "history.jsonl")
@@ -461,6 +497,38 @@ class DeniaSharePlugin(Star):
         if self._bili_cookie:
             self._bili_apply_cookie_to_parser(self._bili_cookie)
 
+        self._log_official_media_plan()
+
+    def _log_official_media_plan(self) -> None:
+        """启动时把 QQ 官方 Bot 的媒体发送方案打一条日志。
+
+        这一条是给「官方 Bot 视频发不出去」排障用的：走本地还是走链接、补位起点、
+        回调地址解析成了什么，都在这里。少了它，用户只能等发送失败后翻日志猜 ——
+        而升级插件不会覆盖已保存的配置值（AstrBot 只补缺失的键），
+        「默认值改了但我的值还是旧的」这种情况光看代码是看不出来的。
+        """
+        try:
+            pconfig = get_config()
+            relay_first = pconfig.OFFICIAL_RELAY_FIRST
+            pad_min = pconfig.OFFICIAL_CHUNK_PAD_MIN_MB
+            base = resolve_callback_base(pconfig.MEDIA_RELAY_CALLBACK_URL)
+        except Exception:
+            logger.warning("[denia_share] 读取官方 Bot 媒体配置失败", exc_info=True)
+            return
+
+        order = "先试中转链接，失败再走本地" if relay_first else "本地上传（分片）优先，链接仅兜底"
+        logger.info(
+            f"[denia_share] 官方 Bot 视频发送：{order}；"
+            f"≥{pad_min}MB（且 ≤10MB）的视频补位到分片上传；回调地址 "
+            f"{base or '（未配置 → 链接兜底不可用）'}"
+        )
+        if pad_min == 0 and not self._official_single_shot_broken:
+            logger.warning(
+                "[denia_share] 补位已关闭且尚未观测到单发失败：≤10MB 的视频会走单次 base64"
+                "（客户端 20 秒超时），上行稍慢就会「上传文件API返回None」重试 5 次；"
+                "出问题就把「官方 Bot 分片上传起点」设成 4～6"
+            )
+
     # ==================== 平台处理器 ====================
 
     def _access_denied(self, event: AstrMessageEvent) -> bool:
@@ -486,10 +554,15 @@ class DeniaSharePlugin(Star):
             logger.warning("[denia_share] 权限判定失败，本次按放行处理", exc_info=True)
             return False
         if not allowed:
+            # 带上平台与管理员标记：这两种 ID 混着用时，光看 user/group 判断不出
+            # 「是不是官方 Bot 的 openid」「管理员豁免有没有生效」
             logger.debug(
-                "[denia_share] 被权限名单拦下：user=%s group=%s",
+                "[denia_share] 被权限名单拦下：platform=%s admin=%s user=%s group=%s private=%s",
+                self._platform_name(event),
+                event.is_admin(),
                 event.get_sender_id(),
                 event.get_group_id(),
+                event.is_private_chat(),
             )
         return not allowed
 
@@ -755,34 +828,65 @@ class DeniaSharePlugin(Star):
 
         header, nodes_content = await self._build_output(result)
 
+        warnings = result.extra.get("limit_warnings") or []
+
+        # 发送模式：卡片 / 文字 / 原始媒体三轴独立，映射与按会话覆盖见 ParserConfig。
+        # 覆盖顺序由精确到宽泛：完整 umo > 群号（含官方 Bot 群 openid）> 平台名。
+        send_card, send_text, send_media = get_config().send_mode_flags_for(
+            event.unified_msg_origin,
+            event.get_group_id(),
+            self._platform_name(event),
+        )
+
         render_path: Path | None = None
-        if self._renderer.enabled:
+        # 卡片不发送时连渲染都不做 —— 渲染要么起浏览器要么画图，白做一次很贵
+        if self._renderer.enabled and send_card:
             render_path = await self._renderer.render(
                 result, cache_key=cache_key, existing=self._render_cache.get(cache_key),
             )
             if render_path is not None:
                 self._render_cache[cache_key] = render_path
 
-        warnings = result.extra.get("limit_warnings") or []
+        # 节点按「文字 / 媒体」切开：仅富媒体要丢掉前者、仅文本要丢掉后者
+        text_items, media_items = split_nodes(nodes_content, self._is_media_item)
+        header_text = header if send_text else ""
+        if not send_text:
+            text_items = []
+        if not send_media:
+            media_items = []
 
         if render_path is not None:
             await self._send_image(event, render_path)
-            # 卡片已承载标题/作者/统计/时长，视频场景不再重复发文字
-            skip_text = bool(result.video_contents)
-            header_text = "" if skip_text else header
-            text_items = [] if skip_text else list(nodes_content)
-        else:
-            header_text = header
-            text_items = list(nodes_content)
-            for w in warnings:
-                text_items.append([Comp.Plain(w)])
+            # 卡片已承载标题/作者/统计/时长与图片，视频场景不再重复发节点
+            if result.video_contents:
+                header_text = ""
+                text_items = []
+                media_items = []
+        elif text_items:
+            # 卡片不在场时「少了几张图」只能靠这条说明带出来（卡片在时由卡片承载）
+            text_items += [[Comp.Plain(w)] for w in warnings]
 
-        if text_items:
-            if self._is_onebot(event):
-                yield await self._build_nodes_result(event, header_text, text_items)
+        # 两种都发时**按原顺序**整串发（与改动前逐字节一致），否则只发留下的那一类
+        items = pick_items(
+            nodes_content,
+            text_items,
+            media_items,
+            keep_text=bool(text_items),
+            keep_media=bool(media_items),
+        )
+
+        if items:
+            # 只有文字才值得合并转发；纯媒体（仅富媒体）直发图片本体 ——
+            # 合并转发在群里长得又是一张「聊天记录卡片」，那正是用户要躲开的东西
+            if self._is_onebot(event) and text_items:
+                yield await self._build_nodes_result(event, header_text, items)
             else:
-                async for r in self._send_plain_output(event, header_text, text_items):
+                async for r in self._send_plain_output(event, header_text, items):
                     yield r
+
+        if not send_media:
+            logger.debug("[denia_share] 发送模式不含视频 / 音频，跳过媒体发送")
+            return
 
         async for r in self._try_send_media(event, result):
             yield r
@@ -1072,11 +1176,19 @@ class DeniaSharePlugin(Star):
         yield event.plain_result(f"截图完成 {url}")
 
     async def _send_image(self, event: AstrMessageEvent, path: Path):
-        """主动发送图片，绕开事件回复管线，避免被附加「引用回复 / @」。"""
+        """发送渲染好的卡片图片。
+
+        OneBot 那边走主动发送是为了绕开事件回复管线（避免被附加「引用回复 / @」）；
+        但 QQ 官方 Bot **必须**走 ``event.send``：官方适配器的 ``send_by_session``
+        一律不带 msg_id（见 :meth:`_post_official_media` 的说明），会被 QQ 判成
+        「主动消息」而回报无权限。
+        """
+        chain = MessageChain().file_image(str(path))
         try:
-            sent = await self.context.send_message(
-                event.unified_msg_origin, MessageChain().file_image(str(path)),
-            )
+            if self._is_qq_official(event):
+                await event.send(chain)
+                return
+            sent = await self.context.send_message(event.unified_msg_origin, chain)
             if not sent:
                 logger.warning(f"解析卡片主动发送未找到匹配平台会话: {path.name}")
         except Exception as e:
@@ -1166,11 +1278,20 @@ class DeniaSharePlugin(Star):
 
         所以开了「媒体中转」就先把文件注册成 ``{回调地址}/api/file/<token>``
         用 URL 发送；没开、注册失败、或地址不合法时，回退成原来的本地文件发送。
+
+        **QQ 官方 Bot 是另一套语义**：它不走协议端读文件，而是由框架把本地文件
+        转 base64 / 分片上传给 QQ 服务器，所以本地上传才是默认路径；中转 URL 会
+        被 QQ 服务器直接拉取，要求回调地址**公网可达** —— 只有用户显式打开
+        「官方 Bot 也走中转链接」时才那么发。
         """
         pconfig = get_config()
+        # OneBot：共享目录与「媒体中转」二选一，由 MEDIA_RELAY_ENABLED 决定（默认共享目录）。
+        # 官方 Bot 不走这里 —— 它的媒体一律由 _send_official_video 主动发送，
+        # 好让失败可见并逐级回退（链接 → 本地 → 文字）。
         relay_enabled = pconfig.MEDIA_RELAY_ENABLED
         callback_base = pconfig.MEDIA_RELAY_CALLBACK_URL
         ttl = pconfig.MEDIA_RELAY_TTL
+        is_official = self._is_qq_official(event)
 
         for cont in result.contents:
             if not isinstance(cont, (VideoContent, AudioContent)):
@@ -1180,6 +1301,14 @@ class DeniaSharePlugin(Star):
                 continue
 
             if isinstance(cont, VideoContent):
+                if is_official:
+                    # 官方 Bot 一律走这条：链接优先 → 本地（按需分片）→ 文字兜底，
+                    # 每一步失败都能被插件看见（见 _send_official_video）
+                    async for r in self._send_official_video(
+                        event, path, result.url, pconfig
+                    ):
+                        yield r
+                    continue
                 url = None
                 if relay_enabled:
                     url = await register_file(path, callback_base, ttl)
@@ -1194,6 +1323,193 @@ class DeniaSharePlugin(Star):
             else:
                 # 语音走 base64，不依赖文件系统，无需中转
                 yield event.chain_result([Comp.Record(file=str(path))])
+
+    async def _send_official_video(
+        self, event: AstrMessageEvent, path: Path, link: str | None, pconfig: Any
+    ) -> AsyncGenerator[MessageEventResult, None]:
+        """QQ 官方 Bot 的视频发送：本地（分片）优先 → 链接 → 文字，逐级回退。
+
+        为什么不像 OneBot 那样直接 yield 一个 ``Comp.Video`` 就走人：官方适配器对
+        本地文件是框架自己上传，≤10MB 走单次 base64、客户端超时只有 20 秒
+        （``BotHttp(timeout=20)``），上行稍慢就「上传文件API返回None」重试 5 次后失败
+        —— 而这个失败发生在框架的发送阶段，插件原本看不见、也补救不了。
+        改用主动发送（``send_message``）后异常会回到这里，于是能补救。
+
+        **为什么默认是本地分片而不是链接**（实测结论，见 README）：
+        AstrBot 的 ``file_token_service`` 是**一次性**的 —— ``handle_file`` 取一次
+        就把 token ``pop`` 掉。QQ 拉取只要有一次没拉完（访问日志里那次是 8.89MB 拉到
+        4.68MB 就断），框架的后续重试全部 404，整条链接路径必然失败；
+        而分片上传是把文件直接推进 QQ 的预签名 COS 地址，没有一次性状态，
+        单请求预算还有 300 秒、4 路并发。所以：
+
+        1. **本地优先**：≤10MB 先补位到略超 10MB 走分片（``pad_to_chunked_upload``），
+           单发失败就补位重试一次并把「本机单发不可靠」记下来；
+        2. 本地两次都不行 → 链接兜底（若解析得到回调地址）；
+        3. 仍然失败 → 发一条带原链接的文字，别让用户什么都收不到。
+        """
+
+        async def _try_local() -> bool:
+            send_path = await self._prepare_official_video(path, pconfig)
+            if await self._post_official_media(
+                event, Comp.Video.fromFileSystem(str(send_path))
+            ):
+                return True
+            # 单次上传失败 → 补位到分片再来一次，并把「本机单发不可靠」记住
+            if send_path == path:
+                retry_path = await pad_to_chunked_upload(path)
+                if retry_path != path:
+                    self._remember_official_single_shot_broken()
+                    if await self._post_official_media(
+                        event, Comp.Video.fromFileSystem(str(retry_path))
+                    ):
+                        return True
+            return False
+
+        async def _try_relay() -> bool:
+            base = resolve_callback_base(pconfig.MEDIA_RELAY_CALLBACK_URL)
+            if not base:
+                logger.info(
+                    f"[denia_share] 官方 Bot 无可用回调地址（想试链接请填「AstrBot 回调地址」）: {path.name}"
+                )
+                return False
+            url = await register_file(path, base, pconfig.MEDIA_RELAY_TTL)
+            if not url:
+                logger.info(f"[denia_share] 官方 Bot 注册中转链接失败: {path.name}")
+                return False
+            ok = await self._post_official_media(event, Comp.Video.fromURL(url))
+            if ok:
+                logger.info(
+                    f"[denia_share] 官方 Bot 视频走中转链接（QQ 服务器拉取）: {path.name}"
+                )
+            else:
+                logger.warning(
+                    f"[denia_share] 官方 Bot 中转链接不可用（{base}）或 QQ 拉取失败: {path.name}"
+                    "（注意 AstrBot 的文件 Token 是一次性的，框架重试必然 404）"
+                )
+            return ok
+
+        if pconfig.OFFICIAL_RELAY_FIRST:
+            logger.info(
+                f"[denia_share] 官方 Bot 视频优先试中转链接（配置项「官方 Bot 视频优先用中转链接」已开）: {path.name}"
+            )
+            ok = await _try_relay() or await _try_local()
+        else:
+            ok = await _try_local() or await _try_relay()
+        if ok:
+            return
+
+        if link:
+            yield event.plain_result(
+                f"⚠️ 视频发送失败（QQ 官方 Bot 上传链路不通），原链接：{link}"
+            )
+        else:
+            yield event.plain_result("⚠️ 视频发送失败（QQ 官方 Bot 上传链路不通）")
+
+    async def _post_official_media(self, event: AstrMessageEvent, comp: Any) -> bool:
+        """把单个媒体组件发出去；失败吞掉并留痕，返回是否成功。
+
+        **必须用 ``event.send`` 而不是 ``context.send_message``**：
+        官方适配器把 ``_allow_group_proactive_send`` 硬编码成 True
+        （``qqofficial_platform_adapter.py:324``），于是 ``send_by_session`` 里
+        ``if msg_id and not allow_group_proactive_send`` 永远不成立 —— payload 里
+        **从不带 msg_id**（:410），等于一律按「主动消息」发送；而多数机器人没有
+        主动消息权限，QQ 直接回 ``ServerError: 主动消息失败, 无权限``
+        （实测：分片上传 33 秒成功，最后死在这一步）。
+
+        走 ``event.send`` 才会带上**入站消息的 msg_id** 作为被动回复
+        （``qqofficial_message_event.py:215 → _post_send_one``），既合法，
+        又能让上传/发送的异常抛回这里由上层补救。
+        """
+        try:
+            await event.send(MessageChain(chain=[comp]))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[denia_share] 官方 Bot 媒体发送异常（上传超时 / QQ 侧拒绝都会走这里）",
+                exc_info=True,
+            )
+            return False
+        return True
+
+    def _load_official_single_shot_broken(self) -> bool:
+        """读取「本机单次 base64 上传不可靠」的记忆；没记录过就按可靠处理。"""
+        try:
+            raw = json.loads(self._official_upload_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except Exception:
+            logger.warning(
+                "[denia_share] 读取官方 Bot 上传状态失败，本次按未失败处理", exc_info=True
+            )
+            return False
+        return bool(raw.get("single_shot_broken"))
+
+    def _remember_official_single_shot_broken(self) -> None:
+        """记下「单次上传不可靠」，之后直接走分片（写入数据目录，重启仍生效）。"""
+        if self._official_single_shot_broken:
+            return
+        self._official_single_shot_broken = True
+        logger.warning(
+            "[denia_share] 观测到官方 Bot 单次 base64 上传失败，"
+            "之后的小视频将直接走分片上传（可用「官方 Bot 分片上传起点」手动调）"
+        )
+        try:
+            self._official_upload_file.write_text(
+                json.dumps({"single_shot_broken": True}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            logger.warning("[denia_share] 保存官方 Bot 上传状态失败", exc_info=True)
+
+    async def _prepare_official_video(self, path: Path, pconfig: Any) -> Path:
+        """QQ 官方 Bot 本地视频的发送前处理：先诊断，再按需补位到分片上传。
+
+        框架走哪条上传路径**只由文件体积决定**，而两条路的时间预算差 15 倍
+        （单次 base64 客户端 20s / 分片单请求 300s），所以这里把体积与预测路径
+        写进日志：下次出现「上传文件API返回None」时，一眼就知道落在哪条路上。
+        详见 ``core.media_utils.pad_to_chunked_upload``。
+        """
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return path
+
+        size_mb = size / 1024 / 1024
+        threshold = QQ_CHUNKED_UPLOAD_THRESHOLD_BYTES
+        pad_min_mb = pconfig.OFFICIAL_CHUNK_PAD_MIN_MB
+
+        if size > threshold:
+            logger.info(
+                f"[denia_share] 官方 Bot 视频 {size_mb:.1f}MB → 框架走分片上传"
+                f"（5MB/片、4 路并发、单请求 300 秒）: {path.name}"
+            )
+            return path
+
+        if should_pad_for_chunked(
+            size,
+            pad_min_mb=pad_min_mb,
+            single_shot_broken=self._official_single_shot_broken,
+            threshold=threshold,
+        ):
+            return await pad_to_chunked_upload(path, threshold=threshold)
+
+        # 单次 base64 的 body ≈ 体积 × 4/3；框架客户端超时 20 秒 → 反推所需上行
+        need_mbps = size * 4 / 3 * 8 / 20 / 1024 / 1024
+        # 日志用 %s 拼消息体而不是 f-string 里的长表达式，保持与仓库其它日志一致
+        logger.info(
+            "[denia_share] 官方 Bot 视频 %.1fMB → 框架走单次 base64 上传"
+            "（客户端超时 20 秒，需要约 %.1f Mbps 上行；超时会重试 5 次后失败）: %s",
+            size_mb, need_mbps, path.name,
+        )
+        if size_mb >= 5:
+            logger.warning(
+                "[denia_share] 该视频已接近单次上传的 20 秒超时边界：若日志出现"
+                "「上传文件API返回None」，把「官方 Bot 分片上传起点」设成不大于 %.0f"
+                " 即可改走分片上传（一次失败后本插件也会自动切到分片）",
+                size_mb,
+            )
+        return path
 
     # ==================== B站扫码登录 ====================
 

@@ -63,7 +63,14 @@
         "type": "bool",
         "default": false,
         "invisible": true,
-        "hint": "开启后名单里的用户 / 群不能触发解析，管理员仍豁免。与白名单同时开启时先看白名单、再看黑名单"
+        "hint": "开启后名单里的用户 / 群不能触发解析，管理员默认仍豁免（见下一项）。与白名单同时开启时先看白名单、再看黑名单"
+      },
+      "BLACKLIST_ADMIN_EXEMPT": {
+        "description": "管理员豁免黑名单",
+        "type": "bool",
+        "default": true,
+        "invisible": true,
+        "hint": "开启（默认）时管理员不受黑名单影响；**关掉后黑名单对管理员同样生效** —— 想让某个群连管理员都不响应，就把群号填进「黑名单群组」并把这里关掉。这一项只影响黑名单：管理员一直不受白名单限制"
       },
       "BLACKLIST_USER": {
         "description": "黑名单用户",
@@ -107,6 +114,17 @@
           "1080P+",
           "4K",
           "8K"
+        ]
+      },
+      "BILI_CODEC": {
+        "description": "B站视频编码",
+        "type": "string",
+        "default": "H264兼容",
+        "invisible": true,
+        "hint": "H264兼容：只取 H.264 流，电脑版 QQ 才能正常播放（默认）。全部编码：额外允许 HEVC/AV1，可以拿到 4K/8K，但电脑版 QQ 会花屏或放不出来",
+        "options": [
+          "H264兼容",
+          "全部编码"
         ]
       }
     }
@@ -296,6 +314,25 @@
     "type": "object",
     "description": "视频怎么送到消息平台：共享目录或中转链接",
     "items": {
+      "SEND_MODE": {
+        "description": "发送模式",
+        "type": "string",
+        "default": "全部发送",
+        "invisible": true,
+        "hint": "全部发送=卡片 + 文字 + 图片/视频都发；仅文本=卡片 + 文字，不发图片/视频；仅富媒体=只发图片/视频原图，不发卡片也不发文字。媒体在解析阶段就已下载，这两档省的是「发送」而不是带宽。想只对某个群 / 某个平台生效，用下面的「按会话覆盖发送模式」",
+        "options": [
+          "全部发送",
+          "仅文本",
+          "仅富媒体"
+        ]
+      },
+      "SEND_MODE_OVERRIDES": {
+        "description": "按会话覆盖发送模式",
+        "type": "string",
+        "default": "",
+        "invisible": true,
+        "hint": "给单个群 / 平台指定发送模式，形如 `972781741=仅富媒体`、`21E86DB833C12870E3287DF3C5704B5F=仅文本`、`qq_official=仅文本`。键可以填群号、官方 Bot 群 openid、平台名（aiocqhttp / qq_official）或完整 umo；优先级 umo > 群号 > 平台名 > 上面的全局默认。留空 = 全部走全局默认"
+      },
       "CACHE_DIR": {
         "description": "共享缓存目录",
         "type": "string",
@@ -315,7 +352,7 @@
         "type": "string",
         "default": "",
         "invisible": true,
-        "hint": "留空时回退 AstrBot 全局 callback_api_base。必须填「消息平台所在容器能访问到」的地址，同一 Docker 网络内可直接用容器名，如 http://astrbot:6185"
+        "hint": "留空时回退 AstrBot 全局 callback_api_base。必须填「消息平台所在容器能访问到」的地址，同一 Docker 网络内可直接用容器名，如 http://astrbot:6185。QQ 官方 Bot 场景下该地址必须**公网可达**（由 QQ 服务器来拉取），且官方 Bot 默认不用中转，见下面的「官方 Bot 也走中转链接」"
       },
       "MEDIA_RELAY_TTL": {
         "description": "中转链接有效期",
@@ -323,6 +360,20 @@
         "default": 300,
         "invisible": true,
         "hint": "到期后链接失效。视频越大、链路越慢越要留足时间，建议不低于 120 秒"
+      },
+      "OFFICIAL_RELAY_FIRST": {
+        "description": "官方 Bot 视频优先用中转链接（不推荐）",
+        "type": "bool",
+        "default": false,
+        "invisible": true,
+        "hint": "默认走**本地上传**（>10MB 或补位后走分片上传，单请求 300 秒）。打开这一项会让官方 Bot 的视频先注册成链接、由 QQ 服务器来拉 —— 但实测走不通：AstrBot 的文件 Token 是**一次性**的（file_token_service 取一次就 pop），QQ 那边只要有一次没拉完（或先发了 HEAD），框架的后续重试全部 404，整条链接路径必然失败。仅当你的机器上行极快、文件很小，才值得一试"
+      },
+      "OFFICIAL_CHUNK_PAD_MIN_MB": {
+        "description": "官方 Bot 分片上传起点（MB）",
+        "type": "int",
+        "default": 4,
+        "invisible": true,
+        "hint": "默认 4：官方 Bot 上 4MB 以上（且不超过 10MB）的视频会被补到略超 10MB，逼框架走**分片上传**（每片 5MB、4 路并发、单请求 300 秒）—— 因为不超过 10MB 是单次 base64、客户端超时只有 20 秒，上行稍慢就「上传文件API返回None」重试 5 次后失败。填 0 = 关闭（上行很快、想省流量时）；也可以填 6～8 只对更大的视频补位。另外：一旦本机被观察到单发失败一次，之后 ≤10MB 的视频会自动走分片，无需再设这一项"
       }
     }
   },

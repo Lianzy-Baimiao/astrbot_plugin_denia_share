@@ -19,9 +19,20 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .send_mode import (
+    is_send_mode,
+    mode_flags,
+    parse_mode_overrides,
+    resolve_mode_flags,
+)
+
 _config = None
 
 _HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+# 发送模式的三轴开关与「按会话覆盖」的解析都在 core/send_mode.py（纯逻辑、可单测），
+# 这里只负责把它们接到配置上。
+
 
 # 配置分组：展示顺序即此处的顺序，常用在前、折腾在后
 CONFIG_GROUPS: tuple[tuple[str, str], ...] = (
@@ -162,7 +173,20 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "label": "启用黑名单",
         "type": "bool",
         "default": False,
-        "hint": "开启后名单里的用户 / 群不能触发解析，管理员仍豁免。与白名单同时开启时先看白名单、再看黑名单",
+        "hint": "开启后名单里的用户 / 群不能触发解析，管理员默认仍豁免（见下一项）。与白名单同时开启时先看白名单、再看黑名单",
+    },
+    {
+        "key": "BLACKLIST_ADMIN_EXEMPT",
+        "group": "权限控制",
+        "subgroup": "黑名单",
+        "label": "管理员豁免黑名单",
+        "type": "bool",
+        "default": True,
+        "hint": (
+            "开启（默认）时管理员不受黑名单影响；**关掉后黑名单对管理员同样生效** —— "
+            "想让某个群连管理员都不响应，就把群号填进「黑名单群组」并把这里关掉。"
+            "这一项只影响黑名单：管理员一直不受白名单限制"
+        ),
     },
     {
         "key": "BLACKLIST_USER",
@@ -204,6 +228,18 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "default": "1080P",
         "options": ["360P", "480P", "720P", "1080P", "1080P+", "4K", "8K"],
         "hint": "高画质需要对应账号权限；未登录时实际只能拿到 720P",
+    },
+    {
+        "key": "BILI_CODEC",
+        "group": "B站设置",
+        "label": "B站视频编码",
+        "type": "select",
+        "default": "H264兼容",
+        "options": ["H264兼容", "全部编码"],
+        "hint": (
+            "H264兼容：只取 H.264 流，电脑版 QQ 才能正常播放（默认）。"
+            "全部编码：额外允许 HEVC/AV1，可以拿到 4K/8K，但电脑版 QQ 会花屏或放不出来"
+        ),
     },
     # ---------------- Steam 设置 ---------------- #
     {
@@ -401,6 +437,35 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
     },
     # ---------------- 媒体发送 ---------------- #
     {
+        "key": "SEND_MODE",
+        "group": "媒体发送",
+        "label": "发送模式",
+        "type": "select",
+        "default": "全部发送",
+        "options": ["全部发送", "仅文本", "仅富媒体"],
+        "hint": (
+            "全部发送=卡片 + 文字 + 图片/视频都发；仅文本=卡片 + 文字，不发图片/视频；"
+            "仅富媒体=只发图片/视频原图，不发卡片也不发文字。"
+            "媒体在解析阶段就已下载，这两档省的是「发送」而不是带宽。"
+            "想只对某个群 / 某个平台生效，用下面的「按会话覆盖发送模式」"
+        ),
+    },
+    {
+        "key": "SEND_MODE_OVERRIDES",
+        "group": "媒体发送",
+        "label": "按会话覆盖发送模式",
+        "type": "string",
+        "default": "",
+        "list": True,
+        "placeholder": "群号=仅富媒体，回车添加",
+        "hint": (
+            "给单个群 / 平台指定发送模式，形如 `972781741=仅富媒体`、"
+            "`21E86DB833C12870E3287DF3C5704B5F=仅文本`、`qq_official=仅文本`。"
+            "键可以填群号、官方 Bot 群 openid、平台名（aiocqhttp / qq_official）或完整 umo；"
+            "优先级 umo > 群号 > 平台名 > 上面的全局默认。留空 = 全部走全局默认"
+        ),
+    },
+    {
         "key": "CACHE_DIR",
         "group": "媒体发送",
         "subgroup": "方式一 · 本地共享目录",
@@ -438,7 +503,9 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "placeholder": "http://astrbot:6185",
         "hint": (
             "留空时回退 AstrBot 全局 callback_api_base。必须填「消息平台所在容器能访问到」的地址，"
-            "同一 Docker 网络内可直接用容器名，如 http://astrbot:6185"
+            "同一 Docker 网络内可直接用容器名，如 http://astrbot:6185。"
+            "QQ 官方 Bot 场景下该地址必须**公网可达**（由 QQ 服务器来拉取），"
+            "且官方 Bot 默认不用中转，见下面的「官方 Bot 也走中转链接」"
         ),
     },
     {
@@ -452,6 +519,38 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "max": 86400,
         "unit": "秒",
         "hint": "到期后链接失效。视频越大、链路越慢越要留足时间，建议不低于 120 秒",
+    },
+    {
+        "key": "OFFICIAL_RELAY_FIRST",
+        "group": "媒体发送",
+        "subgroup": "方式二 · 中转链接",
+        "label": "官方 Bot 视频优先用中转链接（不推荐）",
+        "type": "bool",
+        "default": False,
+        "hint": (
+            "默认走**本地上传**（>10MB 或补位后走分片上传，单请求 300 秒）。"
+            "打开这一项会让官方 Bot 的视频先注册成链接、由 QQ 服务器来拉 —— 但实测走不通："
+            "AstrBot 的文件 Token 是**一次性**的（file_token_service 取一次就 pop），"
+            "QQ 那边只要有一次没拉完（或先发了 HEAD），框架的后续重试全部 404，"
+            "整条链接路径必然失败。仅当你的机器上行极快、文件很小，才值得一试"
+        ),
+    },
+    {
+        "key": "OFFICIAL_CHUNK_PAD_MIN_MB",
+        "group": "媒体发送",
+        "label": "官方 Bot 分片上传起点（MB）",
+        "type": "int",
+        "default": 4,
+        "min": 0,
+        "max": 200,
+        "unit": "MB",
+        "hint": (
+            "默认 4：官方 Bot 上 4MB 以上（且不超过 10MB）的视频会被补到略超 10MB，"
+            "逼框架走**分片上传**（每片 5MB、4 路并发、单请求 300 秒）—— 因为不超过 10MB 是"
+            "单次 base64、客户端超时只有 20 秒，上行稍慢就「上传文件API返回None」重试 5 次后失败。"
+            "填 0 = 关闭（上行很快、想省流量时）；也可以填 6～8 只对更大的视频补位。"
+            "另外：一旦本机被观察到单发失败一次，之后 ≤10MB 的视频会自动走分片，无需再设这一项"
+        ),
     },
     # ---------------- 高级设置 ---------------- #
     {
@@ -930,6 +1029,18 @@ class ParserConfig:
     def BILI_QUALITY(self) -> str:
         return str(self._cfg_get("BILI_QUALITY", "1080P"))
 
+    @property
+    def BILI_CODEC(self) -> str:
+        """B站视频流编码策略：``H264兼容``（默认）或 ``全部编码``。
+
+        只取 H.264 是**兼容性**取舍：B站高清晰度档位的 DASH 流只有 HEVC/AV1，
+        而插件是零转码直接装进 .mp4 的，电脑版 QQ 解不了 HEVC → 花屏 / 放不出来
+        （手机端大多能放，所以症状是「只有电脑 QQ 坏」）。1080P 及以下 AVC 都有，
+        代价只是拿不到 4K/8K。识别不了的值一律按 H264兼容 处理。
+        """
+        val = str(self._cfg_get("BILI_CODEC", "H264兼容") or "").strip()
+        return "全部编码" if val == "全部编码" else "H264兼容"
+
     # ---------------- Steam ---------------- #
 
     @property
@@ -1067,6 +1178,64 @@ class ParserConfig:
         """中转链接有效期（秒），最小 30。"""
         return max(30, int(self._cfg_get("MEDIA_RELAY_TTL", 300)))
 
+    @property
+    def OFFICIAL_RELAY_FIRST(self) -> bool:
+        """QQ 官方 Bot 的视频是否**优先**用中转链接（默认否）。
+
+        默认走本地上传，因为链接路径实测不可靠：AstrBot 的 ``file_token_service``
+        是**一次性**的（``handle_file`` 取一次就 ``pop``），而 QQ 拉取一旦没一次拉完
+        （或先发了 HEAD），框架的后续重试全部 404 —— 整条路必然失败。
+        见 README「官方 Bot 视频发送」。
+        """
+        return bool(self._cfg_get("OFFICIAL_RELAY_FIRST", False))
+
+    @property
+    def OFFICIAL_CHUNK_PAD_MIN_MB(self) -> int:
+        """官方 Bot 上「补位到分片上传」的体积起点（MB，0 = 关闭，默认 4）。
+
+        详见 ``core.media_utils.pad_to_chunked_upload``：框架 ≤10MB 走单次 base64
+        （客户端 20s 超时），补到 10MB 以上就走分片上传（单请求 300s）。
+        """
+        try:
+            value = int(self._cfg_get("OFFICIAL_CHUNK_PAD_MIN_MB", 4) or 0)
+        except (TypeError, ValueError):
+            return 4
+        return max(0, value)
+
+    @property
+    def SEND_MODE(self) -> str:
+        """发送模式：``全部发送`` / ``仅文本`` / ``仅富媒体``（未知值按全部发送）。"""
+        val = str(self._cfg_get("SEND_MODE", "全部发送") or "").strip()
+        return val if is_send_mode(val) else "全部发送"
+
+    @property
+    def SEND_MODE_OVERRIDES(self) -> dict[str, str]:
+        """按会话覆盖发送模式的映射（键已归一化，见 ``core.send_mode``）。"""
+        return parse_mode_overrides(self._cfg_get("SEND_MODE_OVERRIDES", ""))
+
+    @property
+    def send_mode_flags(self) -> tuple[bool, bool, bool]:
+        """把 :attr:`SEND_MODE` 映射成 ``(发卡片, 发文字, 发原始媒体)``。
+
+        「卡片」是渲染出来的那一张图，和「文字 / 原始媒体」分开 —— 所以
+        「仅富媒体」可以做到**不发卡片**只发图片与视频。
+        """
+        return mode_flags(self.SEND_MODE)
+
+    def send_mode_flags_for(self, *keys: Any) -> tuple[bool, bool, bool]:
+        """按会话解析生效的发送模式开关。
+
+        Args:
+            keys: 由精确到宽泛排列的候选键 —— 典型是
+                ``(unified_msg_origin, 群号, 平台名)``。空值会被跳过。
+
+        Returns:
+            命中的第一个覆盖条目的开关；都不命中时回落到 :attr:`send_mode_flags`。
+        """
+        return resolve_mode_flags(
+            self._cfg_get("SEND_MODE_OVERRIDES", ""), self.SEND_MODE, *keys
+        )
+
     # ---------------- 行为与调试 ---------------- #
 
     @property
@@ -1110,6 +1279,15 @@ class ParserConfig:
     @property
     def BLACKLIST_GROUP(self) -> str:
         return str(self._cfg_get("BLACKLIST_GROUP", "") or "")
+
+    @property
+    def BLACKLIST_ADMIN_EXEMPT(self) -> bool:
+        """管理员是否豁免黑名单（默认 True = 旧行为）。
+
+        关掉之后黑名单对管理员同样生效 —— 用来做「这个群连我自己的号都不响应」。
+        只影响黑名单：白名单一直是「管理员不受限」。
+        """
+        return bool(self._cfg_get("BLACKLIST_ADMIN_EXEMPT", True))
 
 
 def init_config(astrbot_config: Any, cache_dir: Path, config_dir: Path) -> ParserConfig:

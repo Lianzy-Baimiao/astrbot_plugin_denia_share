@@ -427,9 +427,18 @@ class BilibiliParser(BaseParser):
             raise IgnoreException(access["message"] or "无法获取视频流")
 
         detecter = VideoDownloadURLDataDetecter(download_url_data)
+        # 编码按配置过滤，默认只取 H.264（AVC）：
+        # B站 4K/8K 档只有 HEVC/AV1 流，而插件是 `ffmpeg -c copy` 零转码把流装进
+        # .mp4 的，电脑版 QQ 解不了 HEVC/AV1 —— 表现是花屏 / 放不出来，手机却正常。
+        # 1080P 及以下 AVC 都有，所以默认档位拿不到 4K/8K 换的是「到处都能放」。
+        # 过滤后拿不到流时，下面还有 html5 单文件 MP4（本来就是 H.264）回退。
+        if pconfig.BILI_CODEC == "全部编码":
+            codecs = [VideoCodecs.AV1, VideoCodecs.AVC, VideoCodecs.HEV]
+        else:
+            codecs = [VideoCodecs.AVC]
         streams = detecter.detect_best_streams(
             video_max_quality=target_quality,
-            codecs=[VideoCodecs.AV1, VideoCodecs.AVC, VideoCodecs.HEV],
+            codecs=codecs,
             no_dolby_video=True, no_hdr=True,
         )
 
@@ -459,6 +468,14 @@ class BilibiliParser(BaseParser):
                 return mp4_url, mp4_backups, None, []
 
         if video_stream is None:
+            # 编码过滤后一条流都不剩（4K/8K 只有 HEVC/AV1），且 html5 单文件 MP4
+            # 也没拿到。这是**策略跳过**而不是网络故障：报 DownloadException 会让
+            # 缺料审计和 CDN 重试循环把它当成「下载失败」逐地址重试一遍。
+            if pconfig.BILI_CODEC != "全部编码":
+                raise IgnoreException(
+                    "该视频没有 H.264 流（仅 HEVC/AV1），电脑版 QQ 播放会花屏；"
+                    "需要它的话把「B站视频编码」改为「全部编码」"
+                )
             raise DownloadException("未找到可下载的视频流")
 
         v_backups = video_stream.backup_url if isinstance(video_stream, VideoStreamDownloadURL) else []
