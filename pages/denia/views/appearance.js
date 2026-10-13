@@ -378,7 +378,7 @@ export function createAppearanceView(ctx) {
     });
 
     return card("卡片设计器", "改的是真正发出去的分享卡片，保存后立即生效", [
-      switchField("卡片渲染", "RENDER_ENABLED", "渲染卡片", "纯文本", "关闭后解析结果以纯文本发送，不再生成图片"),
+      switchField("卡片渲染", "RENDER_ENABLED", "启用卡片", "关闭卡片", "还需在发送模式中勾选卡片；关闭仅停发卡片，不影响文本和富媒体"),
       h("div", { class: "field" }, [
         h("div", { class: "field-label", text: "卡片主题" }),
         themeSeg,

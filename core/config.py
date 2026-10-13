@@ -20,8 +20,9 @@ from pathlib import Path
 from typing import Any
 
 from .send_mode import (
+    SEND_OPTIONS,
     is_send_mode,
-    mode_flags,
+    normalize_mode,
     parse_mode_overrides,
     resolve_mode_flags,
 )
@@ -308,7 +309,7 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "label": "启用卡片渲染",
         "type": "bool",
         "default": True,
-        "hint": "关闭则回退为纯文本输出",
+        "hint": "卡片总开关：仅当发送模式勾选卡片且此项开启时发送卡片；关闭不影响文本和富媒体",
     },
     {
         "key": "RENDER_THEME",
@@ -440,13 +441,14 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "key": "SEND_MODE",
         "group": "媒体发送",
         "label": "发送模式",
-        "type": "select",
-        "default": "全部发送",
-        "options": ["全部发送", "仅文本", "仅富媒体"],
+        "type": "multiselect",
+        "default": list(SEND_OPTIONS),
+        "options": list(SEND_OPTIONS),
         "hint": (
-            "全部发送=卡片 + 文字 + 图片/视频都发；仅文本=卡片 + 文字，不发图片/视频；"
-            "仅富媒体=只发图片/视频原图，不发卡片也不发文字。"
-            "媒体在解析阶段就已下载，这两档省的是「发送」而不是带宽。"
+            "多选，可任意组合：文本=一条精简文字；卡片=渲染的分享图片；富媒体=原始图片/视频/音频。"
+            "文本和卡片互不排斥，卡片还需开启「启用卡片渲染」；全部取消则不发送解析产物。"
+            "文字只保留标题、干净地址、简洁播放信息，基础信息返回即先发，不等待媒体下载/卡片渲染。已知限制并入同一条；后续下载失败记日志/卡片，不补发摘要。"
+            "媒体下载在解析阶段启动，发送模式不节省下载带宽。"
             "想只对某个群 / 某个平台生效，用下面的「按会话覆盖发送模式」"
         ),
     },
@@ -457,10 +459,11 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         "type": "string",
         "default": "",
         "list": True,
-        "placeholder": "群号=仅富媒体，回车添加",
+        "placeholder": "群号=文本+卡片，回车添加",
         "hint": (
-            "给单个群 / 平台指定发送模式，形如 `972781741=仅富媒体`、"
-            "`21E86DB833C12870E3287DF3C5704B5F=仅文本`、`qq_official=仅文本`。"
+            "给单个群 / 平台指定发送选项，用 + 组合，如 `972781741=文本+卡片`、"
+            "`qq_official=文本+卡片+富媒体`；`群号=不发送` 全部关闭，兼容旧模式名。"
+            "覆盖项中的卡片同样受「启用卡片渲染」开关控制。"
             "键可以填群号、官方 Bot 群 openid、平台名（aiocqhttp / qq_official）或完整 umo；"
             "优先级 umo > 群号 > 平台名 > 上面的全局默认。留空 = 全部走全局默认"
         ),
@@ -759,6 +762,16 @@ def coerce_value(item: dict[str, Any], raw: Any) -> tuple[Any, str | None]:
             return None, f"{label}：不能大于 {high}"
         return value, None
 
+    if kind == "multiselect":
+        if key == "SEND_MODE":
+            if not is_send_mode(raw):
+                return None, f"{label}：请从 文本 / 卡片 / 富媒体 中选择，可多选或全部取消"
+            return normalize_mode(raw), None
+        options = item.get("options") or []
+        if not isinstance(raw, list) or any(value not in options for value in raw):
+            return None, f"{label}：需要是有效选项的列表"
+        return [option for option in options if option in raw], None
+
     text = "" if raw is None else str(raw).strip()
     if kind == "select":
         options = item.get("options") or []
@@ -821,7 +834,7 @@ def verify_schema_alignment(schema: dict[str, Any]) -> list[str]:
 
 
 def migrate_grouped_config(config: Any) -> bool:
-    """旧版扁平配置 → 分组配置，幂等。"""
+    """旧版扁平配置 → 分组配置，并把旧发送模式转为多选列表，幂等。"""
     changed = False
     for group, keys in CONFIG_GROUP_KEYS.items():
         group_cfg = config.get(group)
@@ -832,6 +845,18 @@ def migrate_grouped_config(config: Any) -> bool:
             default = _DEFAULTS.get(key)
             flat_val = config.get(key, default)
             nested_val = group_cfg.get(key, default)
+            if key == "SEND_MODE":
+                # 比较前先统一类型，否则旧「全部发送」会挡住扁平旧值迁移。
+                flat_val = normalize_mode(flat_val)
+                nested_val = normalize_mode(nested_val)
+                selected = flat_val if nested_val == default and flat_val != default else nested_val
+                if group_cfg.get(key) != selected:
+                    group_cfg[key] = selected
+                    changed = True
+                if key in config and config[key] != default:
+                    config[key] = list(default)
+                    changed = True
+                continue
             if nested_val == default and flat_val != default:
                 group_cfg[key] = flat_val
                 config[key] = default
@@ -856,10 +881,14 @@ class ParserConfig:
                 default_val = _DEFAULTS.get(key, default)
                 flat_val = self._cfg.get(key, default_val)
                 nested_val = group_cfg[key]
+                if key == "SEND_MODE":
+                    flat_val = normalize_mode(flat_val)
+                    nested_val = normalize_mode(nested_val)
                 if nested_val == default_val and flat_val != default_val:
                     return flat_val
                 return nested_val
-        return self._cfg.get(key, default)
+        value = self._cfg.get(key, default)
+        return normalize_mode(value) if key == "SEND_MODE" else value
 
     # ---------------- WebUI 读写 ---------------- #
 
@@ -904,7 +933,8 @@ class ParserConfig:
                 group_cfg = {}
                 self._cfg[_KEY_GROUP_MAP[key]] = group_cfg
             group_cfg[key] = value
-            self._cfg[key] = item["default"]
+            default = item["default"]
+            self._cfg[key] = list(default) if isinstance(default, list) else default
             changed.append(key)
 
         if changed:
@@ -1203,10 +1233,9 @@ class ParserConfig:
         return max(0, value)
 
     @property
-    def SEND_MODE(self) -> str:
-        """发送模式：``全部发送`` / ``仅文本`` / ``仅富媒体``（未知值按全部发送）。"""
-        val = str(self._cfg_get("SEND_MODE", "全部发送") or "").strip()
-        return val if is_send_mode(val) else "全部发送"
+    def SEND_MODE(self) -> list[str]:
+        """独立勾选的发送类型，兼容旧版模式；返回副本，空列表保持不发送。"""
+        return normalize_mode(self._cfg_get("SEND_MODE", list(SEND_OPTIONS)))
 
     @property
     def SEND_MODE_OVERRIDES(self) -> dict[str, str]:
@@ -1215,12 +1244,8 @@ class ParserConfig:
 
     @property
     def send_mode_flags(self) -> tuple[bool, bool, bool]:
-        """把 :attr:`SEND_MODE` 映射成 ``(发卡片, 发文字, 发原始媒体)``。
-
-        「卡片」是渲染出来的那一张图，和「文字 / 原始媒体」分开 —— 所以
-        「仅富媒体」可以做到**不发卡片**只发图片与视频。
-        """
-        return mode_flags(self.SEND_MODE)
+        """全局 ``(发卡片, 发文字, 发原始媒体)``，卡片额外受总开关控制。"""
+        return self.send_mode_flags_for()
 
     def send_mode_flags_for(self, *keys: Any) -> tuple[bool, bool, bool]:
         """按会话解析生效的发送模式开关。
@@ -1230,11 +1255,12 @@ class ParserConfig:
                 ``(unified_msg_origin, 群号, 平台名)``。空值会被跳过。
 
         Returns:
-            命中的第一个覆盖条目的开关；都不命中时回落到 :attr:`send_mode_flags`。
+            命中的第一个覆盖项或全局选项，卡片始终额外受 RENDER_ENABLED 控制。
         """
-        return resolve_mode_flags(
+        card, text, media = resolve_mode_flags(
             self._cfg_get("SEND_MODE_OVERRIDES", ""), self.SEND_MODE, *keys
         )
+        return card and self.RENDER_ENABLED, text, media
 
     # ---------------- 行为与调试 ---------------- #
 

@@ -11,7 +11,9 @@ from typing import Any, ClassVar, TypedDict
 from pathlib import Path
 from datetime import datetime
 from dataclasses import field, dataclass
-from collections.abc import Iterator, Awaitable
+from collections.abc import Iterator, Awaitable, Callable
+
+from astrbot.api import logger
 
 from .task import PathTask
 from .constants import PlatformEnum, platform_meta
@@ -108,6 +110,31 @@ class ParseResult:
     extra: dict[str, Any] = field(default_factory=dict)
     repost: ParseResult | None = None
     render_image: Path | None = None
+    # 非必要的卡片信息（如 B站 AI 总结、在线人数）延后加载，不阻塞基础解析/文字。
+    card_details_loader: Callable[[], Awaitable[None]] | None = field(default=None, repr=False)
+    _card_details_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    CARD_DETAILS_TIMEOUT: ClassVar[float] = 5.0
+
+    async def prepare_card_details(self) -> None:
+        """仅渲染时按需补充卡片字段；同一结果只加载一次，失败/超时不阻断发送。"""
+        if self.card_details_loader is None:
+            return
+        if self._card_details_task is None:
+            loader = self.card_details_loader
+
+            async def load() -> None:
+                try:
+                    await asyncio.wait_for(loader(), timeout=self.CARD_DETAILS_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning("[denia_share] 卡片附加信息获取超时，使用已有信息继续渲染")
+                except Exception as error:
+                    logger.warning(
+                        f"[denia_share] 卡片附加信息获取失败（{type(error).__name__}），继续渲染"
+                    )
+
+            self._card_details_task = asyncio.create_task(load())
+        # 一个会话取消不能把另一个会话共用的补充信息任务一起取消；任务本身有上限。
+        await asyncio.shield(self._card_details_task)
 
     @property
     def header(self) -> str | None:
@@ -244,8 +271,9 @@ class ParseResult:
 
         **为什么要有这个方法**：下载失败原先只在日志里留痕，产出物本身却在撒谎
         —— 少了 3 张图的消息和图一张不缺的消息长得一模一样，用户没法判断该不该
-        重试。这里在渲染/发送之前统一结算一次，把缺料写进既有的警告通道
-        （``limit_warnings`` 已被卡片与聊天消息两处消费），让产物如实反映它缺了什么。
+        重试。这里在卡片/媒体发送之前结算，把缺料写进既有的警告通道
+        ``limit_warnings``，供卡片和 WebUI 展示；精简文字先发，不等待本方法，
+        后发现的缺料不再补发第二条摘要。
 
         **为什么要把 ``IgnoreException`` 排除在外**：那是本仓「**故意不下载**」的信号
         （视频时长超限、媒体体积超限、0 字节响应、m3u8 分片超限）。这些情况各自已经
@@ -256,7 +284,7 @@ class ParseResult:
         只在确有失败时才追加，成功路径零开销（一次 gather，本来也要等这些任务）。
 
         **本方法是幂等的**：同一个 ``ParseResult`` 会被结算多次 —— 聊天链路
-        （``main._deliver``）每次交付都调一次，而 ``_result_cache`` 命中的结果会被
+        （``main._deliver``）发送卡片/媒体时调用，而 ``_result_cache`` 命中的结果会被
         再交付一次（同一条链接在群里发两遍）；WebUI 的「按当前外观重渲染」也会对
         缓存里的**同一个对象**再调一次（``webui._preview_payload``）。不做处理的话
         「⚠️ 3 张图片下载失败」会一次一条越叠越多，而 warnings 还参与产物缓存键，
@@ -347,3 +375,4 @@ class ParseResultKwargs(TypedDict, total=False):
     author: Author | None
     extra: dict[str, Any]
     repost: ParseResult | None
+    card_details_loader: Callable[[], Awaitable[None]] | None

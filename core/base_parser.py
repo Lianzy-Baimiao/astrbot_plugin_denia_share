@@ -12,6 +12,7 @@ from re import Match, Pattern, compile
 from typing import Any, ClassVar, cast, final
 from typing_extensions import Unpack
 
+from .share_text import source_url
 from .data import Platform, ParseResult, Author, VideoContent, ImageContent, AudioContent, ParseResultKwargs
 from .task import PathTask
 from .download import StreamDownloader
@@ -175,7 +176,10 @@ class BaseParser:
         handler = self._handlers.get(searched.re)
         if handler is None:
             raise SilentException(f"无法匹配 {keyword}")
-        return await handler(self, searched)
+        result = await handler(self, searched)
+        if not result.url:
+            result.url = source_url(searched)
+        return result
 
     @final
     async def parse_with_redirect(self, url: str, headers: dict[str, str] | None = None) -> ParseResult:

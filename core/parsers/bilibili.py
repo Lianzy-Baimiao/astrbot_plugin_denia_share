@@ -128,10 +128,22 @@ class BilibiliParser(BaseParser):
         opus = await article.turn_to_opus()
         return await self._parse_bilibli_api_opus(opus)
 
+    def _credential_for_metadata(self) -> Credential | None:
+        """基本信息请求只读取本地 Cookie，不在发文字前联网校验/刷新凭证。
+
+        下载仍通过 credential 属性校验和刷新；这不是跳过视频访问权限检查。
+        """
+        if self._credential is not None:
+            return self._credential
+        if self._bili_ck:
+            return Credential.from_cookies(ck2dict(self._bili_ck))
+        self._load_credential()
+        return self._credential
+
     async def parse_video(self, *, bvid: str | None = None, avid: int | None = None, page_num: int = 1):
         from ..models.bilibili.video import VideoInfo, AIConclusion
 
-        credential = await self.credential
+        credential = self._credential_for_metadata()
         video = Video(bvid=bvid, aid=avid, credential=credential)
         video_info = convert(
             await self._call_bili_api_with_retry(video.get_info, operation="视频信息"),
@@ -144,20 +156,6 @@ class BilibiliParser(BaseParser):
         pconfig = get_config()
 
         cid = page_info.cid
-        ai_summary = "B站 AI 总结暂时不可用"
-        if credential and cid is not None:
-            try:
-                ai_result = await self._call_bili_api_with_retry(
-                    lambda: video.get_ai_conclusion(cid=cid), operation="AI总结",
-                )
-                ai_conclusion = convert(ai_result, AIConclusion)
-                ai_summary = ai_conclusion.summary
-            except Exception as error:
-                # AI 总结是附加信息，接口临时超时不应阻断标题、封面和视频解析
-                logger.warning(f"B站 AI 总结获取失败，跳过该字段继续解析：{error}")
-        else:
-            ai_summary = "哔哩哔哩 cookie 未配置或失效, 无法使用 AI 总结"
-
         url = f"https://bilibili.com/{video_info.bvid}"
         if page_info.index > 0:
             url += f"?p={page_info.index + 1}"
@@ -177,33 +175,45 @@ class BilibiliParser(BaseParser):
 
         stats_line = " ".join(f"{k} {fmt_num(v)}" for k, v in stats_map.items() if v > 0)
 
-        # 获取实时在线人数
-        online_text = ""
-        if cid is not None:
-            try:
-                online_data = await video.get_online(cid=cid)
-                total = int(online_data.get("total", 0))
-                count = int(online_data.get("count", 0))
-                if total > 0:
-                    online_text = f"🏄‍♂️ {total} 人正在观看，{count} 人在网页端观看"
-            except Exception as e:
-                pass
-        else:
-            logger.debug("cid 为 None，跳过在线人数获取")
-
         # 时长限制提示（大小限制在下载时动态检查）
         limit_warnings = []
         if page_info.duration > pconfig.VIDEO_DURATION_MAXIMUM:
             limit_warnings.append(f"⚠️ 视频时长({duration_str})超过限制({fmt_duration(pconfig.VIDEO_DURATION_MAXIMUM)})，不会下载视频")
 
         extra = {
-            "info": ai_summary,
+            "info": "B站 AI 总结暂时不可用",
             "stats_line": stats_line,
             "duration": duration_str,
-            "online": online_text,
+            "online": "",
             "content_type": "视频",
             "limit_warnings": limit_warnings,
         }
+
+        async def load_card_details():
+            # 这两项不在精简文字里，只有实际渲染卡片时才请求；上层统一限时。
+            async def load_ai():
+                if credential and cid is not None:
+                    try:
+                        ai_result = await self._call_bili_api_with_retry(
+                            lambda: video.get_ai_conclusion(cid=cid), operation="AI总结",
+                        )
+                        extra["info"] = convert(ai_result, AIConclusion).summary
+                    except Exception as error:
+                        logger.warning(f"B站 AI 总结获取失败，跳过该字段继续渲染：{error}")
+                else:
+                    extra["info"] = "哔哩哔哩 cookie 未配置或失效, 无法使用 AI 总结"
+
+            async def load_online():
+                if cid is not None:
+                    try:
+                        data = await video.get_online(cid=cid)
+                        total, count = int(data.get("total", 0)), int(data.get("count", 0))
+                        if total > 0:
+                            extra["online"] = f"🏄‍♂️ {total} 人正在观看，{count} 人在网页端观看"
+                    except Exception:
+                        pass
+
+            await asyncio.gather(load_ai(), load_online())
 
         async def download_video():
             output_path = pconfig.cache_dir / f"{video_info.bvid}-{page_num}.mp4"
@@ -263,7 +273,7 @@ class BilibiliParser(BaseParser):
         return self.result(
             url=url, title=page_info.title, timestamp=page_info.timestamp,
             text=video_info.desc, author=author, contents=[video_content],
-            extra=extra,
+            extra=extra, card_details_loader=load_card_details,
         )
 
     async def parse_dynamic_or_opus(self, dynamic_id: int):
@@ -397,6 +407,10 @@ class BilibiliParser(BaseParser):
         credential = await self.credential
         if video is None:
             video = Video(bvid=bvid, aid=avid, credential=credential)
+        else:
+            # 基本信息阶段可能用的是尚未校验的 Cookie 快照。下载必须使用
+            # 此处校验/刷新后的凭证（可能已换成新对象，不能继续用旧引用）。
+            video.credential = credential if credential is not None else Credential()
 
         try:
             download_url_data = await self._call_bili_api_with_retry(

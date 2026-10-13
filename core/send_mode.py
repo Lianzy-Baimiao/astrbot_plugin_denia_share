@@ -12,19 +12,14 @@ from typing import Any, Callable, Iterable
 
 from astrbot.api import logger
 
-# 发送模式 →（发卡片, 发文字, 发原始媒体）。形状取自 yaya 的 OUTPUT_MODE_FLAGS
-# （那边是「文本 / 富媒体」两档），这里多切一刀「卡片」——因为卡片是**渲染出来的
-# 一张图**，用户想「只发视频、别刷卡片」时它必须能单独关掉。
-#
-#   卡片 = 渲染出的分享卡片；文字 = header 与纯文本节点；
-#   原始媒体 = 图集 / 图文原图节点 + 视频 + 音频。
-#
-# 「全部发送」与只有两档时的行为一致（卡片+文字+图片节点+视频），零回归。
-_SEND_MODES: tuple[str, ...] = ("全部发送", "仅文本", "仅富媒体")
-_SEND_MODE_FLAGS: dict[str, tuple[bool, bool, bool]] = {
-    "全部发送": (True, True, True),
-    "仅文本": (True, True, False),
-    "仅富媒体": (False, False, True),
+# 三项可独立勾选；富媒体指原始图片 / 视频 / 音频，不包含渲染卡片。
+SEND_OPTIONS: tuple[str, ...] = ("文本", "卡片", "富媒体")
+_LEGACY_SELECTIONS: dict[str, tuple[str, ...]] = {
+    "全部发送": SEND_OPTIONS,
+    "文本+富媒体": ("文本", "富媒体"),
+    "仅文本": ("文本",),
+    "仅富媒体": ("富媒体",),
+    "不发送": (),
 }
 
 # 覆盖表的条目分隔符：与 permissions 的名单共用同一套（逗号 / 顿号 / 空白）
@@ -36,21 +31,41 @@ def norm_mode_key(raw: Any) -> str:
     return str(raw or "").strip().casefold()
 
 
+def _mode_selection(value: Any) -> list[str] | None:
+    """解析多选列表或旧版 / 覆盖表写法。None 表示无效，[] 表示明确不发送。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if text in _LEGACY_SELECTIONS:
+            return list(_LEGACY_SELECTIONS[text])
+        value = [part.strip() for part in text.split("+")]
+    if not isinstance(value, (list, tuple)):
+        return None
+    if any(not isinstance(part, str) or part not in SEND_OPTIONS for part in value):
+        return None
+    return [option for option in SEND_OPTIONS if option in value]
+
+
 def is_send_mode(value: Any) -> bool:
-    """是否是合法的发送模式取值。"""
-    return str(value or "").strip() in _SEND_MODES
+    """是否是合法的发送选项列表或兼容写法（空列表也合法）。"""
+    return _mode_selection(value) is not None
+
+
+def normalize_mode(value: Any) -> list[str]:
+    """统一为按界面顺序排列的独立列表；未知值保持旧版「全部发送」回退。"""
+    selection = _mode_selection(value)
+    return list(SEND_OPTIONS) if selection is None else selection
 
 
 def mode_flags(mode: Any) -> tuple[bool, bool, bool]:
-    """模式 → ``(发卡片, 发文字, 发原始媒体)``；未知值按「全部发送」。"""
-    val = str(mode or "").strip()
-    return _SEND_MODE_FLAGS.get(val, _SEND_MODE_FLAGS["全部发送"])
+    """选项 → ``(发卡片, 发文字, 发原始媒体)``，空选项不发送任何产物。"""
+    selected = normalize_mode(mode)
+    return "卡片" in selected, "文本" in selected, "富媒体" in selected
 
 
 def parse_mode_overrides(raw: Any) -> dict[str, str]:
     """解析「按会话覆盖发送模式」的配置串。
 
-    格式：``键=模式``，多条用逗号 / 顿号 / 空白分隔。键可以是
+    格式：``键=文本+卡片``（兼容旧模式名），``键=不发送`` 可全部关闭，多条用逗号 / 顿号 / 空白分隔。键可以是
 
     * 完整 umo（``aiocqhttp:GroupMessage:972781741``）—— 最精确；
     * 群号 / 群 openid（``972781741``、``21E86DB8...``）；
@@ -75,7 +90,7 @@ def parse_mode_overrides(raw: Any) -> dict[str, str]:
         if not is_send_mode(mode):
             logger.warning(
                 f"[denia_share] 发送模式覆盖表里的模式无效，已忽略: {part}"
-                f"（可选 {' / '.join(_SEND_MODES)}）"
+                "（可用 文本 / 卡片 / 富媒体，以 + 组合；不发送=全部关闭；兼容旧模式名）"
             )
             continue
         if key in overrides and overrides[key] != mode:

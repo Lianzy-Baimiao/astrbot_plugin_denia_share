@@ -80,7 +80,11 @@ export function createConfigView(ctx) {
   }
 
   function setDraft(key, value) {
-    if (value === values[key]) {
+    const saved = values[key];
+    const equal = Array.isArray(value) && Array.isArray(saved)
+      ? value.length === saved.length && value.every((entry) => saved.includes(entry))
+      : value === saved;
+    if (equal) {
       delete draft[key];
     } else {
       draft[key] = value;
@@ -734,6 +738,31 @@ export function createConfigView(ctx) {
     return h("div", {}, parts);
   }
 
+  /** 独立多选：直接保存数组，空数组表示全部取消，不套用字符串名单编辑器。 */
+  function multiSelectControl(item) {
+    const options = item.options || [];
+    const labels = item.labels || [];
+    const picked = new Set(currentValue(item.key) || []);
+    return h("div", { class: "pick-grid", role: "group", "aria-label": item.label },
+      options.map((option, index) => {
+        const box = h("input", {
+          type: "checkbox",
+          checked: picked.has(option) ? true : null,
+        });
+        const chip = h("label", {
+          class: `pick-chip${picked.has(option) ? " is-picked" : ""}`,
+        }, [box, h("span", { text: labels[index] || option })]);
+        box.addEventListener("change", () => {
+          if (box.checked) picked.add(option);
+          else picked.delete(option);
+          chip.classList.toggle("is-picked", box.checked);
+          onValueChanged(item.key, options.filter((entry) => picked.has(entry)));
+        });
+        return chip;
+      }),
+    );
+  }
+
   function buildControl(item) {
     const value = currentValue(item.key);
 
@@ -763,6 +792,10 @@ export function createConfigView(ctx) {
         input,
         item.unit ? h("span", { class: "unit", text: item.unit }) : null,
       ]);
+    }
+
+    if (item.type === "multiselect") {
+      return multiSelectControl(item);
     }
 
     if (item.type === "select") {

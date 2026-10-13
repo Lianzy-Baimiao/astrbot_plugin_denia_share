@@ -778,7 +778,7 @@ class ShareCardRenderer:
         cache_key: str | None = None,
         existing: Path | None = None,
     ) -> Path | None:
-        """异步渲染卡片，失败时返回 None（由调用方回退到文本输出）。"""
+        """异步渲染卡片，失败时返回 None；是否发送文字由发送模式独立决定。"""
         if not self.enabled:
             return None
         try:
@@ -787,10 +787,12 @@ class ShareCardRenderer:
             out_path = self._output_path(cache_key, result)
             if out_path.exists():
                 return out_path
-            images = await self._collect_images(result)
+            images, _ = await asyncio.gather(
+                self._collect_images(result), result.prepare_card_details(),
+            )
             return await asyncio.to_thread(self._render_sync, result, images, out_path)
         except Exception:
-            logger.exception("解析卡片渲染失败，已回退到文本输出")
+            logger.exception("解析卡片渲染失败，跳过卡片，保留其他已选输出")
             return None
 
     def _output_path(self, cache_key: str | None, result: ParseResult) -> Path:

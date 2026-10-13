@@ -46,7 +46,7 @@ from .core.data import (
 )
 from .core.history import HistoryStore, ParseRecord
 from .core.permissions import is_allowed
-from .core.send_mode import pick_items, split_nodes
+from .core.share_text import build_share_text
 from .core.relay import register_file, resolve_callback_base
 from .core.constants import (
     PLATFORM_DISPLAY_NAMES, PlatformEnum, is_custom_platform, platform_meta,
@@ -168,11 +168,6 @@ class DeniaSharePlugin(Star):
             return str(event.get_platform_name() or "")
         except Exception:
             return ""
-
-    @staticmethod
-    def _is_media_item(item: list) -> bool:
-        """该节点条目是不是媒体（图片）—— 供 ``split_nodes`` 切分文字 / 媒体。"""
-        return any(isinstance(comp, Comp.Image) for comp in item)
 
     @staticmethod
     def _fallback_cache_dir(data_dir: Path) -> tuple[Path, str]:
@@ -783,7 +778,7 @@ class DeniaSharePlugin(Star):
             async for r in self._deliver(event, result, cache_key):
                 yield r
 
-            # 交付完成后再记录：此时媒体都已落盘，记录里能带上真实文件名
+            # 按已完成的产物记录，不为了历史记录拖延文字；仅文本时媒体可能仍在下载。
             await self._record_history(result, self._render_cache.get(cache_key))
 
         except SilentException as e:
@@ -811,10 +806,24 @@ class DeniaSharePlugin(Star):
 
         链接解析与 /pixiv 搜索共用这条输出链路。
         """
-        # 先结算媒体下载再构建产物：下载失败的条目会在这里被记进
-        # result.extra["limit_warnings"]，卡片与聊天消息都会如实带上
-        # 「少了几张图」的说明 —— 否则图少了 3 张的消息和图一张不缺的消息
-        # 长得一模一样，用户只能靠肉眼数。
+        # 先决定输出类型。文字只依赖元数据，必须在任何媒体 await 之前 yield；
+        # audit_missing_media 会等待视频下载/合并，不能再把它放在文字前面。
+        send_card, send_text, send_media = get_config().send_mode_flags_for(
+            event.unified_msg_origin,
+            event.get_group_id(),
+            self._platform_name(event),
+        )
+        if send_text:
+            summary = build_share_text(result)
+            if summary:
+                yield event.plain_result(summary)
+
+        # 仅文本（或全部取消）不在交付链等待媒体。解析器已经启动的后台下载
+        # 保持原有行为；后续才知道的失败记日志/卡片，不补发第二条文字。
+        if not send_card and not send_media:
+            return
+
+        # 卡片仍需准确反映最终缺料情况，但不能拖住已经准备好的文字。
         try:
             missing = await result.audit_missing_media()
         except Exception:
@@ -826,18 +835,6 @@ class DeniaSharePlugin(Star):
                 f"{'、'.join(f'{k}×{v}' for k, v in missing.items())}"
             )
 
-        header, nodes_content = await self._build_output(result)
-
-        warnings = result.extra.get("limit_warnings") or []
-
-        # 发送模式：卡片 / 文字 / 原始媒体三轴独立，映射与按会话覆盖见 ParserConfig。
-        # 覆盖顺序由精确到宽泛：完整 umo > 群号（含官方 Bot 群 openid）> 平台名。
-        send_card, send_text, send_media = get_config().send_mode_flags_for(
-            event.unified_msg_origin,
-            event.get_group_id(),
-            self._platform_name(event),
-        )
-
         render_path: Path | None = None
         # 卡片不发送时连渲染都不做 —— 渲染要么起浏览器要么画图，白做一次很贵
         if self._renderer.enabled and send_card:
@@ -847,42 +844,15 @@ class DeniaSharePlugin(Star):
             if render_path is not None:
                 self._render_cache[cache_key] = render_path
 
-        # 节点按「文字 / 媒体」切开：仅富媒体要丢掉前者、仅文本要丢掉后者
-        text_items, media_items = split_nodes(nodes_content, self._is_media_item)
-        header_text = header if send_text else ""
-        if not send_text:
-            text_items = []
-        if not send_media:
-            media_items = []
-
         if render_path is not None:
             await self._send_image(event, render_path)
-            # 卡片已承载标题/作者/统计/时长与图片，视频场景不再重复发节点
-            if result.video_contents:
-                header_text = ""
-                text_items = []
-                media_items = []
-        elif text_items:
-            # 卡片不在场时「少了几张图」只能靠这条说明带出来（卡片在时由卡片承载）
-            text_items += [[Comp.Plain(w)] for w in warnings]
-
-        # 两种都发时**按原顺序**整串发（与改动前逐字节一致），否则只发留下的那一类
-        items = pick_items(
-            nodes_content,
-            text_items,
-            media_items,
-            keep_text=bool(text_items),
-            keep_media=bool(media_items),
+        # 文本已发；此处仅等待并构建原图，绝不因下载结束再生成第二条文字。
+        _, media_items = await self._build_output(
+            result, include_text=False, include_media=send_media,
         )
-
-        if items:
-            # 只有文字才值得合并转发；纯媒体（仅富媒体）直发图片本体 ——
-            # 合并转发在群里长得又是一张「聊天记录卡片」，那正是用户要躲开的东西
-            if self._is_onebot(event) and text_items:
-                yield await self._build_nodes_result(event, header_text, items)
-            else:
-                async for r in self._send_plain_output(event, header_text, items):
-                    yield r
+        if media_items:
+            async for r in self._send_plain_output(event, "", media_items):
+                yield r
 
         if not send_media:
             logger.debug("[denia_share] 发送模式不含视频 / 音频，跳过媒体发送")
@@ -1194,46 +1164,14 @@ class DeniaSharePlugin(Star):
         except Exception as e:
             logger.warning(f"解析卡片主动发送异常: {e}")
 
-    @staticmethod
-    async def _build_nodes_result(event: AstrMessageEvent, header: str, items: list[list]):
-        sender_name = event.get_sender_name()
-        sender_id = event.get_sender_id()
-        nodes = Comp.Nodes([])
-
-        def _node(content):
-            # AstrBot 4.x 的 Node.__init__(content, **_) 会把 uin/name 吞进 **_ 丢弃，
-            # 必须构造后赋值属性，否则合并转发里昵称与 QQ 号全空
-            node = Comp.Node(content=content)
-            node.uin = sender_id
-            node.name = sender_name
-            return node
-
-        if header:
-            nodes.nodes.append(_node([Comp.Plain(header)]))
-        for item in items:
-            nodes.nodes.append(_node(item))
-        return event.chain_result([nodes])
-
-    async def _build_output(self, result: ParseResult) -> tuple[str, list[list]]:
-        """统一构建 (标题头, 内容节点列表)。"""
-        header = f"希望解析器 | {result.platform.display_name} - {result.content_type}"
-        if result.author:
-            header += f" @{result.author.name}"
-
+    async def _build_output(
+        self, result: ParseResult, *, include_text: bool = True, include_media: bool = True,
+    ) -> tuple[str, list[list]]:
+        """构建一条精简文本与原始图片列表；图文中的正文不再重复发送。"""
+        summary = build_share_text(result) if include_text else ""
         nodes: list[list] = []
-        if result.title:
-            nodes.append([Comp.Plain(result.title)])
-        if result.text:
-            nodes.append([Comp.Plain(result.text[:300])])
-
-        for key, prefix in (
-            ("stats_line", ""),
-            ("duration", "⏱ 时长："),
-            ("online", ""),
-            ("info", "📝 "),
-        ):
-            if value := result.extra.get(key):
-                nodes.append([Comp.Plain(f"{prefix}{value}")])
+        if not include_media:
+            return summary, nodes
 
         for image in result.img_contents:
             path = await image.path_task.safe_get()
@@ -1244,13 +1182,10 @@ class DeniaSharePlugin(Star):
                 path = await graphic.path_task.safe_get()
                 if path:
                     nodes.append([Comp.Image.fromFileSystem(str(path))])
-            elif isinstance(graphic, str):
-                nodes.append([Comp.Plain(graphic)])
-
-        return header, nodes
+        return summary, nodes
 
     async def _send_plain_output(self, event: AstrMessageEvent, header: str, nodes_content: list[list]):
-        """非 OneBot 平台：合并成一条消息链。"""
+        """将图片等组件合并成一条普通消息链（各平台共用，不做合并转发）。"""
         parts: list = []
         if header:
             parts.append(Comp.Plain(header + "\n"))
