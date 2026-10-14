@@ -14,6 +14,7 @@
    a_bogus 签名 + ttwid 会话，稳定性更好，是 HTML 路径失败后的兜底。
 """
 
+import asyncio
 import re
 from typing import Any, ClassVar
 
@@ -23,14 +24,17 @@ from astrbot.api import logger
 
 from ...base_parser import BaseParser, PlatformEnum, ParseException, handle
 from ...data import Platform, platform_of
+from ...douyin_quality import low_bitrate_urls
+from ...exception import DownloadException
 
 
 class DouyinParser(BaseParser):
     platform: ClassVar[Platform] = platform_of(PlatformEnum.DOUYIN)
 
-    def __init__(self, downloader):
+    def __init__(self, downloader, *, prefer_low_quality: bool = False):
         super().__init__(downloader)
         self._web_client = None
+        self.prefer_low_quality = prefer_low_quality
 
     # ------------------------------------------------------------------ #
     # URL 注册
@@ -121,11 +125,17 @@ class DouyinParser(BaseParser):
         author = self.create_author(video_data.author.nickname, video_data.avatar_url)
         result = self.result(title=video_data.desc, author=author, timestamp=video_data.create_time)
 
+        urls = []
+        if self.prefer_low_quality and video_data.video:
+            urls.extend(low_bitrate_urls(video_data.video.bit_rate))
+        if video_url := video_data.video_url:
+            urls.append(video_url)
+        urls = list(dict.fromkeys(urls))
         if image_urls := video_data.image_urls:
             result.contents.extend(self.create_images(image_urls))
-        elif video_url := video_data.video_url:
+        elif urls:
             self._add_limit_warning(result, video_data.duration)
-            result.video = self.create_video(video_url, video_data.cover_url, video_data.duration)
+            result.video = self._create_selected_video(urls, video_data.cover_url, video_data.duration)
         else:
             # 既没有图片也没有视频：多半是 SSR 结构变了、或命中了另一种页面变体。
             # 必须抛出去让 _parse_douyin 继续走后面的路径与兜底接口 —— 返回一个
@@ -241,7 +251,7 @@ class DouyinParser(BaseParser):
         return url.replace("/playwm/", "/play/").replace("playwm?", "play?")
 
     @classmethod
-    def _video_urls(cls, item: dict) -> list[str]:
+    def _video_urls(cls, item: dict, *, prefer_low_quality: bool = False) -> list[str]:
         """返回按优先级排序的备用视频直链（已去水印）。"""
         urls: list[str] = []
         video = item.get("video") or {}
@@ -251,6 +261,8 @@ class DouyinParser(BaseParser):
         for bitrate in video.get("bit_rate") or []:
             if isinstance(bitrate, dict) and (found := cls._first_url(bitrate.get("play_addr"))):
                 urls.append(cls._no_watermark(found))
+        if prefer_low_quality:
+            urls = low_bitrate_urls(video.get("bit_rate")) + urls
         # 去重保序
         return list(dict.fromkeys(urls))
 
@@ -302,6 +314,27 @@ class DouyinParser(BaseParser):
                 return value / 1000 if value > 1000 else value
         return 0.0
 
+    def _create_selected_video(self, urls: list[str], cover: str | None, duration: float | None):
+        if not self.prefer_low_quality:
+            return self.create_video(urls[0], cover, duration)
+        # create_video applies the existing duration limit and cancels the task
+        # before it starts when the work is too long.
+        task = asyncio.create_task(self._download_video_candidates(urls))
+        return self.create_video(task, cover, duration)
+
+    async def _download_video_candidates(self, urls: list[str]):
+        # A stale low-bitrate CDN URL must not discard an otherwise usable video.
+        # Bound retry work; cancellation and size-policy exceptions propagate.
+        candidates = list(dict.fromkeys(urls))[:6]
+        for index, url in enumerate(candidates):
+            try:
+                return await self.downloader.download_video(url, ext_headers=self.headers)
+            except DownloadException:
+                if index == len(candidates) - 1:
+                    raise
+                logger.info("[douyin] 低码率候选下载失败，尝试备用地址")
+        raise DownloadException("抖音没有可用的视频地址")
+
     def _build_result_from_item(self, item: dict):
         author_info = item.get("author") or {}
         avatar = self._first_url(author_info.get("avatar_larger") or author_info.get("avatar_thumb"))
@@ -315,7 +348,7 @@ class DouyinParser(BaseParser):
         )
 
         image_urls = self._image_urls(item)
-        video_urls = self._video_urls(item)
+        video_urls = self._video_urls(item, prefer_low_quality=self.prefer_low_quality)
 
         # **图片优先，与 parse_video 的判定保持一致。**
         # 图文帖（note / slides）的 item 里也有顶层 video —— 抖音会给图文生成一段
@@ -325,7 +358,7 @@ class DouyinParser(BaseParser):
         elif video_urls:
             duration = self._duration(item)
             self._add_limit_warning(result, duration)
-            result.video = self.create_video(video_urls[0], self._cover_url(item), duration)
+            result.video = self._create_selected_video(video_urls, self._cover_url(item), duration)
         elif slide_videos := self._slide_video_urls(item):
             # 没有任何静态图、只有内嵌视频段：这种作品本质就是视频
             for slide_url in slide_videos:

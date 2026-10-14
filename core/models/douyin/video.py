@@ -44,6 +44,8 @@ class Video(Struct):
     play_addr: PlayAddr
     cover: Cover
     duration: int
+    # Preserve rendition metadata from SSR instead of dropping unknown fields.
+    bit_rate: Any = None
 
 
 class Image(Struct):

@@ -39,6 +39,7 @@ from .core.media_utils import (
     pad_to_chunked_upload,
     should_pad_for_chunked,
 )
+from .core.official_video import OfficialVideoOptimizer
 from .core.config import init_config, get_config, verify_schema_alignment
 from .core.download import StreamDownloader
 from .core.data import (
@@ -56,7 +57,7 @@ from .core.constants import (
 # 不用再在装饰器里手写一遍版本字符串（以前改版本要同时改三处，漏一处就版本不一致）
 from . import __version__
 from .core.exception import (
-    ParseException, IgnoreException, SilentException,
+    ParseException, IgnoreException, SilentException, MediaProcessException,
 )
 from .core.card_renderer import ShareCardRenderer
 from .core.screenshot import ScreenshotService, is_probably_screenshotable
@@ -302,6 +303,7 @@ class DeniaSharePlugin(Star):
         self._custom_parser_keys: set[str] = set()
         self._init_parsers()
         self._result_cache: dict[str, ParseResult] = {}
+        self._official_video_optimizer = OfficialVideoOptimizer()
         self._render_cache: dict[str, Path] = {}
         self._cache_cleanup_task: asyncio.Task | None = None
 
@@ -779,7 +781,16 @@ class DeniaSharePlugin(Star):
             return
         url = event.message_str.strip()
         try:
+            low_quality = (
+                isinstance(parser, DouyinParser) and self._is_qq_official(event)
+                and get_config().OFFICIAL_VIDEO_OPTIMIZE
+            )
             cache_key = self.result_cache_key(url)
+            if low_quality:
+                cache_key += ":qq-low"
+                # Request-local parser: concurrent OneBot/WebUI calls must not
+                # inherit a mutable quality flag from an official-Bot request.
+                parser = DouyinParser(self.downloader, prefer_low_quality=True)
             result = self._result_cache.get(cache_key)
             if result is None:
                 keyword, searched = parser.search_url(url)
@@ -1319,6 +1330,17 @@ class DeniaSharePlugin(Star):
         2. 本地两次都不行 → 链接兜底（若解析得到回调地址）；
         3. 仍然失败 → 发一条带原链接的文字，别让用户什么都收不到。
         """
+
+        if pconfig.OFFICIAL_VIDEO_OPTIMIZE:
+            try:
+                path = await self._official_video_optimizer.prepare(path)
+            except MediaProcessException as exc:
+                logger.warning("[denia_share] 官方 Bot 视频优化失败: %s", exc.message)
+                hint = f"⚠️ {exc.message}"
+                if link:
+                    hint += f"，原链接：{link}"
+                yield event.plain_result(hint)
+                return
 
         async def _try_local() -> bool:
             send_path = await self._prepare_official_video(path, pconfig)

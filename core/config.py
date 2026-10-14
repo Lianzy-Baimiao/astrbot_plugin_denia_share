@@ -560,6 +560,14 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "key": "OFFICIAL_VIDEO_OPTIMIZE",
+        "group": "媒体发送",
+        "label": "官方 Bot 视频低码率与压缩",
+        "type": "bool",
+        "default": True,
+        "hint": "默认开启：官方 Bot 的抖音视频优先下载接口提供的最低码率版本；所有平台的视频超过 28 MB 时用 ffmpeg 压缩到 28 MB 内，避免超过 QQ 的 30 MB 视频软限制后变成群文件。需要 ffmpeg 和 ffprobe；压缩失败只提示，不发送超限原文件。关闭则保留原行为。OneBot 不受影响。",
+    },
+    {
         "key": "OFFICIAL_CHUNK_PAD_MIN_MB",
         "group": "媒体发送",
         "label": "官方 Bot 分片上传起点（MB）",
@@ -1239,6 +1247,10 @@ class ParserConfig:
         见 README「官方 Bot 视频发送」。
         """
         return bool(self._cfg_get("OFFICIAL_RELAY_FIRST", False))
+
+    @property
+    def OFFICIAL_VIDEO_OPTIMIZE(self) -> bool:
+        return bool(self._cfg_get("OFFICIAL_VIDEO_OPTIMIZE", True))
 
     @property
     def OFFICIAL_CHUNK_PAD_MIN_MB(self) -> int:
