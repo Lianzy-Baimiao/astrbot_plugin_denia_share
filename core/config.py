@@ -469,6 +469,27 @@ CONFIG_META: tuple[dict[str, Any], ...] = (
         ),
     },
     {
+        "key": "TEXT_TEMPLATE",
+        "group": "媒体发送",
+        "label": "文本模板（Markdown）",
+        "type": "text",
+        "default": "",
+        "rows": 8,
+        "placeholder": (
+            "![封面 #560px #315px]({cover})\n\n**{title}**\n\n{info}\n\n{warnings}\n\n"
+            "AI 总结：{summary}\n\n[立即播放]({play_url})  [原网页]({url})"
+        ),
+        "hint": (
+            "留空=默认精简文本（标题 / 地址 / 时长播放各一行）。填了就按模板发「文本」那一条，"
+            "占位符：{title} {url} {info}(时长·播放) {warnings}(限制提示，每条一行) {summary}(B站 AI 总结) "
+            "{cover}(B站封面地址) {play_url}(B站立即播放) {platform} {author}；"
+            "某行的占位符全为空时整行省略，地址为空的 [文字]() 自动去掉。"
+            "QQ 官方 Bot 按 Markdown 渲染（失败回退纯文本），建议段落之间空一行；"
+            "OneBot / NapCat 不渲染 Markdown，插件会把 ![](…) 换成真图片、[文字](地址) 换成「文字：地址」单独一行、去掉 **。"
+            "用了 {summary} 会多等 AI 总结（最多 5 秒）再发文字，NapCat 下用了 {cover} 会等封面下载完"
+        ),
+    },
+    {
         "key": "CACHE_DIR",
         "group": "媒体发送",
         "subgroup": "方式一 · 本地共享目录",
@@ -1241,6 +1262,11 @@ class ParserConfig:
     def SEND_MODE_OVERRIDES(self) -> dict[str, str]:
         """按会话覆盖发送模式的映射（键已归一化，见 ``core.send_mode``）。"""
         return parse_mode_overrides(self._cfg_get("SEND_MODE_OVERRIDES", ""))
+
+    @property
+    def TEXT_TEMPLATE(self) -> str:
+        """文本模板（如 Markdown）；空串 = 内置精简文本。"""
+        return str(self._cfg_get("TEXT_TEMPLATE", "") or "")
 
     @property
     def send_mode_flags(self) -> tuple[bool, bool, bool]:

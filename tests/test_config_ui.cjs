@@ -106,6 +106,18 @@ const server = http.createServer(async (req, res) => {
     await page.waitForFunction(() => window.ready);
     await checkSelection(["文本", "卡片", "富媒体"]);
     assert.equal(await renderField.locator('input[type="checkbox"]').isChecked(), false);
+    // A saved multi-line template must show up again in its textarea after reload.
+    const template = "**{title}**\n\n{info}\n\n[原网页]({url})";
+    const templateBox = page.locator('.field').filter({ has: page.locator('code', { hasText: /^TEXT_TEMPLATE$/ }) }).locator('textarea');
+    assert.equal(await templateBox.inputValue(), "");
+    await templateBox.fill(template);
+    await save.click();
+    await page.waitForFunction(() => document.querySelector('[data-save-submit]').disabled);
+    assert.equal(lastPayload.TEXT_TEMPLATE, template);
+    await page.reload();
+    await page.waitForFunction(() => window.ready);
+    assert.equal(await templateBox.inputValue(), template);
+    assert.equal(await save.isDisabled(), true);
     // Also verify the independently mounted Appearance view uses the same switch.
     await page.evaluate(async () => {
       const { createAppearanceView } = await import('/pages/denia/views/appearance.js');
@@ -130,7 +142,7 @@ const server = http.createServer(async (req, res) => {
     assert.equal(lastPayload.RENDER_ENABLED, true);
     assert.deepEqual(configAPI().flags, [true, true, true]);
     assert.deepEqual(errors, []);
-    console.log("PASS: real Chromium checkbox independence, all 8 combinations, dirty reset, save/reload, card master switch and Appearance switch; no JS errors.");
+    console.log("PASS: real Chromium checkbox independence, all 8 combinations, dirty reset, save/reload, card master switch, text template round-trip and Appearance switch; no JS errors.");
   } finally {
     if (browser) await browser.close();
     await new Promise(resolve => server.close(resolve));

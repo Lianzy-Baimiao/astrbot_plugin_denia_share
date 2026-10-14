@@ -15,3 +15,6 @@ Thumbs.db
 
 # 开发向文档（目录结构 / 平台实测结论 / 配置项契约 / 网页界面实现机制）：留本地，不进仓库
 DEVELOPMENT.md
+# 本地排查记录与诊断脚本（含本机路径）：留本地，不进仓库
+docs/research/
+scripts/diagnostics/

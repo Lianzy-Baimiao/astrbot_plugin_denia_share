@@ -11,19 +11,18 @@ import asyncio
 import importlib
 import itertools
 import json
-import logging
 import re
 import sys
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from core.share_text import build_share_text, clean_share_url, source_url
+from core.share_text import build_share_text, clean_share_url, source_url, split_markdown
 api = ModuleType("astrbot.api")
-api.logger = logging.getLogger("denia_share_test")
+api.logger = Mock()  # 上架检查只允许 astrbot.api 的 logger，测试里用替身
 with patch.dict(sys.modules, {"astrbot": ModuleType("astrbot"), "astrbot.api": api}):
     from core import config, send_mode
 
@@ -40,6 +39,10 @@ class Image:
     @classmethod
     def fromFileSystem(cls, file):
         return cls(file)
+
+    @classmethod
+    def fromURL(cls, url):
+        return cls(url)
 
 
 class Node:
@@ -84,26 +87,27 @@ def result(**overrides):
         author=SimpleNamespace(name="作者"), content_type="视频",
         extra={"stats_line": "👍 1.2万 🪙 300 👀 12.3万 💭 200", "duration": "3:25", "online": "100 人正在观看", "info": "不应发送的 AI 总结"},
         video_contents=[SimpleNamespace(duration=205)], audio_contents=[],
-        img_contents=[], graphics=[], audit_missing_media=AsyncMock(return_value={}),
+        img_contents=[], graphics=[], audit_missing_media=AsyncMock(return_value={}), video=None,
     )
     data.update(overrides)
     return SimpleNamespace(**data)
 
 
-def load_delivery(mode, *, onebot=True, card=None, render_enabled=True, overrides=""):
+def load_delivery(mode, *, onebot=True, card=None, render_enabled=True, overrides="", template=""):
     tree = ast.parse((ROOT / "main.py").read_text(encoding="utf-8-sig"))
-    names = {"_deliver", "_build_output", "_send_plain_output", "_build_nodes_result", "_is_media_item"}
+    names = {"_deliver", "_build_output", "_send_plain_output", "_build_nodes_result", "_is_media_item", "_markdown_chain"}
     methods = [m for c in tree.body if isinstance(c, ast.ClassDef) for m in c.body if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)) and m.name in names]
     cls = ast.ClassDef(name="Delivery", bases=[], keywords=[], body=methods, decorator_list=[])
     module = ast.fix_missing_locations(ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls], type_ignores=[]))
-    cfg = config.ParserConfig({"SEND_MODE": mode, "RENDER_ENABLED": render_enabled, "SEND_MODE_OVERRIDES": overrides}, ROOT, ROOT)
+    cfg = config.ParserConfig({"SEND_MODE": mode, "RENDER_ENABLED": render_enabled, "SEND_MODE_OVERRIDES": overrides, "TEXT_TEMPLATE": template}, ROOT, ROOT)
     scope = dict(
         Comp=SimpleNamespace(Plain=Plain, Image=Image, Node=Node, Nodes=Nodes),
         ImageContent=ImageContent, logger=api.logger, get_config=lambda: cfg,
         Path=Path, split_nodes=send_mode.split_nodes, pick_items=send_mode.pick_items,
     )
     if (ROOT / "core/share_text.py").exists():
-        scope["build_share_text"] = importlib.import_module("core.share_text").build_share_text
+        share_text = importlib.import_module("core.share_text")
+        scope.update(build_share_text=share_text.build_share_text, split_markdown=share_text.split_markdown)
     exec(compile(module, str(ROOT / "main.py"), "exec"), scope)
     plugin = scope["Delivery"]()
     plugin._renderer = SimpleNamespace(enabled=True, render=AsyncMock(return_value=card))
@@ -111,6 +115,7 @@ def load_delivery(mode, *, onebot=True, card=None, render_enabled=True, override
     plugin._send_image = AsyncMock()
     plugin._platform_name = lambda event: "aiocqhttp" if onebot else "qq_official"
     plugin._is_onebot = lambda event: onebot
+    plugin._is_qq_official = lambda event: not onebot
     plugin.media_sent = []
 
     async def send_media(event, parsed):
@@ -347,6 +352,42 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 plugin._send_image.assert_not_awaited()
                 self.assertEqual(len(plugin.media_sent), 1)
 
+    async def test_template_with_summary_waits_for_card_details_only_then(self):
+        for template, waits in (("{title}\n{summary}", True), ("**{title}**", False)):
+            with self.subTest(template=template):
+                parsed = result()
+                async def load():
+                    parsed.extra["summary"] = "AI 总结内容"
+                parsed.prepare_card_details = AsyncMock(side_effect=load)
+                plugin = load_delivery(["文本"], template=template, onebot=False)
+                messages = await self.collect(plugin, parsed)
+                self.assertEqual(parsed.prepare_card_details.await_count, int(waits))
+                self.assertEqual(messages[0][0].text, "视频标题\nAI 总结内容" if waits else "**视频标题**")
+
+    async def test_napcat_gets_real_cover_image_and_plain_links(self):
+        template = "![封面 #560px #315px]({cover})\n\n**{title}**\n\n{info}\n\n[立即播放]({play_url})  [原网页]({url})"
+        extra = {"duration": "3:25", "cover": "https://i0.hdslb.com/c.jpg", "play_url": "https://player.bilibili.com/player.html?bvid=BV123&p=2&autoplay=true"}
+        for onebot in (True, False):
+            with self.subTest(onebot=onebot):
+                cover = ImageContent(Path("cover.jpg")).path_task
+                parsed = result(extra=dict(extra), video=SimpleNamespace(cover=cover))
+                messages = await self.collect(load_delivery(["文本"], template=template, onebot=onebot), parsed)
+                self.assertEqual(len(messages), 1)
+                if onebot:
+                    image, text = messages[0]
+                    # 用解析时已下载的本地封面，不再按地址重下
+                    self.assertEqual(image.file, "cover.jpg")
+                    self.assertEqual(text.text, "视频标题\n⏱ 3:25\n立即播放：https://player.bilibili.com/player.html?bvid=BV123&p=2&autoplay=true\n原网页：https://www.bilibili.com/video/BV123?p=2")
+                else:
+                    self.assertEqual(len(messages[0]), 1)
+                    self.assertTrue(messages[0][0].text.startswith("![封面 #560px #315px](https://i0.hdslb.com/c.jpg)\n\n**视频标题**"))
+                    cover.safe_get.assert_not_awaited()
+        # 封面没下载成功：只发文字，不因一张封面丢掉整条消息
+        cover = SimpleNamespace(safe_get=AsyncMock(return_value=None))
+        parsed = result(extra=dict(extra), video=SimpleNamespace(cover=cover))
+        messages = await self.collect(load_delivery(["文本"], template=template), parsed)
+        self.assertEqual([type(c) for c in messages[0]], [Plain])
+
     async def test_text_only_is_really_text_only(self):
         image = ImageContent(Path("photo.jpg"))
         plugin = load_delivery("仅文本", card=Path("card.png"))
@@ -455,11 +496,43 @@ class ShareTextTests(unittest.TestCase):
         warnings = ["⚠️ 图片缺失\n1 张", "⚠️ 图片缺失\n1 张", "⚠️ " + "长" * 150, "⚠️ 视频超限"]
         parsed = result(extra={"limit_warnings": warnings}, video_contents=[])
         lines = build_share_text(parsed).splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertEqual(lines[-1].count("图片缺失"), 1)
-        self.assertIn("另有 1 项限制", lines[-1])
-        self.assertLess(len(lines[-1]), 180)
+        # 标题 / 地址 / 两条限制 / 「另有」：每条限制单独一行，不再挤在播放信息后面
+        self.assertEqual(len(lines), 5)
+        self.assertEqual(sum(line.count("图片缺失") for line in lines), 1)
+        self.assertEqual(lines[-1], "另有 1 项限制")
+        self.assertTrue(all(len(line) <= 100 for line in lines))
         self.assertEqual(parsed.extra["limit_warnings"], warnings)
+
+    def test_limit_warning_gets_its_own_line(self):
+        warning = "⚠️ 视频时长(14:46)超过限制(8:00)，不会下载视频"
+        parsed = result(extra={"stats_line": "👀 6064", "duration": "14:46", "limit_warnings": [warning]})
+        self.assertEqual(build_share_text(parsed).splitlines()[-2:], ["⏱ 14:46 · 播放 6064", warning])
+
+    def test_markdown_template_drops_lines_whose_fields_are_empty(self):
+        template = "**{title}**\n\n{info}\n\n{warnings}\n\nAI 总结：{summary}\n\n![封面]({cover})\n\n[原网页]({url}) {unknown}"
+        parsed = result(extra={"duration": "3:25", "summary": "一段\n总结", "cover": "https://i0.hdslb.com/c.jpg"})
+        self.assertEqual(
+            build_share_text(parsed, template),
+            "**视频标题**\n\n⏱ 3:25\n\nAI 总结：一段 总结\n\n![封面](https://i0.hdslb.com/c.jpg)\n\n"
+            "[原网页](https://www.bilibili.com/video/BV123?p=2) {unknown}",
+        )
+        # 未知占位符原样保留（上面），方便发现拼写错误；地址 / 封面（非 http）为空则整行省略
+        bare = build_share_text(result(url=None, extra={"cover": "file:///tmp/c.jpg"}, video_contents=[]), template)
+        self.assertEqual(bare, "**视频标题**")
+        self.assertEqual(build_share_text(parsed, "  \n "), build_share_text(parsed))
+
+    def test_split_markdown_for_platforms_without_markdown(self):
+        text = "![封面 #560px #315px](https://a.example/c.jpg)\n\n**标题**\n\n[立即播放](https://p.example/x)  [](https://b.example/y)\n\n![本地](file:///etc/passwd)"
+        # 非 http(s) 图片不当图片发，原样留在文字里
+        self.assertEqual(split_markdown(text), [
+            ("image", "https://a.example/c.jpg"),
+            ("text", "标题\n立即播放：https://p.example/x\nhttps://b.example/y\n![本地](file:///etc/passwd)"),
+        ])
+
+    def test_empty_link_targets_are_removed(self):
+        parsed = result(extra={})
+        self.assertEqual(build_share_text(parsed, "[立即播放]({play_url})  [原网页]({url})"), "[原网页](https://www.bilibili.com/video/BV123?p=2)")
+        self.assertEqual(build_share_text(parsed, "{info}\n[{title}]({play_url})"), "⏱ 3:25")
 
     def test_source_url_selects_the_parsed_link_and_handles_bare_domains(self):
         for text, expected in (

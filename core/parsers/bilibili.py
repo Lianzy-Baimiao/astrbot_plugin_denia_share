@@ -162,6 +162,10 @@ class BilibiliParser(BaseParser):
 
         # 格式化时长
         duration_str = fmt_duration(page_info.duration)
+        # 接口常给 http://，QQ Markdown 图片要 https；hdslb 两种都能访问
+        cover = page_info.cover or ""
+        if cover.startswith("http://"):
+            cover = "https://" + cover[len("http://"):]
 
         # 格式化统计数据
         s = video_info.stat
@@ -182,6 +186,11 @@ class BilibiliParser(BaseParser):
 
         extra = {
             "info": "B站 AI 总结暂时不可用",
+            # 文本模板用：summary 只放真正取到的 AI 总结，取不到就为空（模板整行省略）
+            "summary": "",
+            "cover": cover,
+            # 模板 {play_url}：B站外链播放器，点开直接播
+            "play_url": f"https://player.bilibili.com/player.html?bvid={video_info.bvid}&p={page_info.index + 1}&autoplay=true",
             "stats_line": stats_line,
             "duration": duration_str,
             "online": "",
@@ -197,7 +206,10 @@ class BilibiliParser(BaseParser):
                         ai_result = await self._call_bili_api_with_retry(
                             lambda: video.get_ai_conclusion(cid=cid), operation="AI总结",
                         )
-                        extra["info"] = convert(ai_result, AIConclusion).summary
+                        conclusion = convert(ai_result, AIConclusion)
+                        extra["info"] = conclusion.summary
+                        # 模板自带标签：只要正文，不要「AI总结:」前缀和「暂不支持」提示
+                        extra["summary"] = conclusion.model_result.summary if conclusion.model_result else ""
                     except Exception as error:
                         logger.warning(f"B站 AI 总结获取失败，跳过该字段继续渲染：{error}")
                 else:

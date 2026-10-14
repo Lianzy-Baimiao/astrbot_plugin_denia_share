@@ -37,11 +37,12 @@ def bili_harness(cache_dir, *, block_credentials=False):
             if block_credentials:
                 await gate.wait()
             return credential
-    page = SimpleNamespace(index=0, title='山东青岛王哥庄新鲜大馒头 一个卖188', duration=168, timestamp=1, cid=123, cover=None)
+    page = SimpleNamespace(index=0, title='山东青岛王哥庄新鲜大馒头 一个卖188', duration=168, timestamp=1, cid=123, cover='http://i0.hdslb.com/bfs/archive/c.jpg')
     info = SimpleNamespace(bvid='BV1G4bw6eEWC', owner=SimpleNamespace(name='作者', face=None), desc='长简介', stat=SimpleNamespace(like=1, coin=1, favorite=1, share=1, reply=1, view=1075000, danmaku=1), rights={}, extract_info_with_page=lambda n: page)
     async def ai(**kwargs):
         await optional_gate.wait()
-        return SimpleNamespace(summary='AI摘要')
+        # 形状同 AIConclusion：summary 带「AI总结:」前缀，model_result.summary 是正文
+        return SimpleNamespace(summary='AI摘要', model_result=SimpleNamespace(summary='摘要正文'))
     async def online(**kwargs):
         await optional_gate.wait()
         return {'total': 10, 'count': 2}
@@ -148,7 +149,27 @@ class BilibiliLatencyTests(unittest.IsolatedAsyncioTestCase):
                     h.video.get_ai_conclusion.assert_awaited_once()
                     h.video.get_online.assert_awaited_once()
                     self.assertEqual(parsed.extra['info'], 'AI摘要')
+                    self.assertEqual(parsed.extra['summary'], '摘要正文')
+                    self.assertEqual(parsed.extra['cover'], 'https://i0.hdslb.com/bfs/archive/c.jpg')
+                    self.assertEqual(parsed.extra['play_url'], 'https://player.bilibili.com/player.html?bvid=BV1G4bw6eEWC&p=1&autoplay=true')
                     self.assertIn('10 人', parsed.extra['online'])
+            finally:
+                for task in h.tasks:
+                    task.cancel()
+                await asyncio.gather(*h.tasks, return_exceptions=True)
+
+    async def test_unsupported_ai_summary_leaves_template_summary_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            h = bili_harness(Path(tmp))
+            h.optional_gate.set()
+            # B站「该视频暂不支持AI总结」：model_result 为空，提示只留给卡片
+            h.video.get_ai_conclusion = AsyncMock(return_value=SimpleNamespace(summary='该视频暂不支持AI总结', model_result=None))
+            try:
+                with patch.dict(sys.modules, {'core.models.bilibili.video': h.model, 'core.config': config, 'astrbot.api': api}), patch.object(config, 'get_config', return_value=h.pconfig):
+                    parsed = await h.parser.parse_video(bvid='BV1G4bw6eEWC')
+                    await parsed.prepare_card_details()
+                self.assertEqual(parsed.extra['info'], '该视频暂不支持AI总结')
+                self.assertEqual(parsed.extra['summary'], '')
             finally:
                 for task in h.tasks:
                     task.cancel()

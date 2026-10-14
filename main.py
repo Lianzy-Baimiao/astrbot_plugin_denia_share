@@ -46,7 +46,8 @@ from .core.data import (
 )
 from .core.history import HistoryStore, ParseRecord
 from .core.permissions import is_allowed
-from .core.share_text import build_share_text
+from .core.share_text import build_share_text, split_markdown
+from .core.card_input import inspect_official_card
 from .core.relay import register_file, resolve_callback_base
 from .core.constants import (
     PLATFORM_DISPLAY_NAMES, PlatformEnum, is_custom_platform, platform_meta,
@@ -562,7 +563,7 @@ class DeniaSharePlugin(Star):
         return not allowed
 
     async def _dispatch(self, event: AstrMessageEvent, name: str):
-        if self._has_json_component(event):
+        if self._has_share_card(event):
             return
         parser = self.parsers.get(name)
         if not parser:
@@ -644,7 +645,7 @@ class DeniaSharePlugin(Star):
     # （加载成功、平台开关里能看到它、自检也过，但聊天链路根本没有入口）。
     #
     # 两条让路规则：
-    # - 消息带 JSON 组件（QQ 小程序卡片）时直接返回：``json_card_handler`` 已经会遍历
+    # - 消息带分享卡片（JSON / 官方原始卡片）时直接返回：``json_card_handler`` 已经会遍历
     #   全部解析器（含自定义），不返回就会把同一链接解析两遍。
     # - URL 归一个**已启用**的内置平台时跳过：那是内置处理器的活，重复处理会发两条。
     #   内置平台被禁用时不算命中，此时自定义解析器可以接过去。
@@ -653,7 +654,7 @@ class DeniaSharePlugin(Star):
     @filter.regex(URL_PATTERN)
     async def custom_parser_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
         """自定义解析器的聊天入口（通用 URL 匹配）"""
-        if self._has_json_component(event):
+        if self._has_share_card(event):
             return
         for link in dict.fromkeys(URL_PATTERN.findall(event.message_str or "")):
             if self._match_builtin_parser(link) is not None:
@@ -680,7 +681,7 @@ class DeniaSharePlugin(Star):
     @filter.regex(URL_PATTERN)
     async def screenshot_fallback_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
         """无可解析平台时按需截图兜底（默认关闭）。"""
-        if not self._screenshot_fallback or self._has_json_component(event):
+        if not self._screenshot_fallback or self._has_share_card(event):
             return
         url = self._first_url(event)
         if not url or self._match_parser(url) is not None:
@@ -727,16 +728,17 @@ class DeniaSharePlugin(Star):
                 f"❌ 搜索出错（{type(e).__name__}），详情见 AstrBot 日志"
             )
 
-    # ==================== JSON 卡片（QQ 小程序分享） ====================
+    # ==================== 分享卡片（QQ 小程序 / 官方平台） ====================
 
     @filter.regex(r".*")
     async def json_card_handler(self, event: AstrMessageEvent, matched: re.Match | None = None):
-        """QQ 小程序分享卡片（Json 消息段）里的链接解析"""
-        if not self._has_json_component(event):
+        """QQ 分享卡片解析（NapCat JSON / 官方平台原始卡片）"""
+        official_card = self._official_card_input(event)
+        if not self._has_json_component(event) and official_card is None:
+            return
+        if self._access_denied(event):
             return
         links = self._extract_links_from_event(event)
-        if not links:
-            return
         for link in dict.fromkeys(links):
             for parser in self.parsers.values():
                 try:
@@ -746,6 +748,15 @@ class DeniaSharePlugin(Star):
                     return
                 except (SilentException, ParseException):
                     continue
+        if official_card is not None:
+            # Keep unmatched cards quiet in chat; never log raw payload values.
+            logger.info(
+                "[denia_share] QQ官方卡片未匹配到已启用平台的链接/BV号；"
+                "raw=%s，候选=%d，平台数=%d，已检查=%s，截断=%s。"
+                "仅反映插件可见输入；没有视频地址/BV号时，请直接发 BV 号或分享链接。",
+                official_card.raw_kind, len(links), len(self.parsers),
+                ",".join(official_card.sources), official_card.truncated,
+            )
 
     # ==================== 核心流程 ====================
 
@@ -814,8 +825,16 @@ class DeniaSharePlugin(Star):
             self._platform_name(event),
         )
         if send_text:
-            summary = build_share_text(result)
-            if summary:
+            template = get_config().TEXT_TEMPLATE
+            if "{summary}" in template:
+                # 只有模板要 AI 总结才等它（上限 5 秒）；默认文本不等
+                await result.prepare_card_details()
+            summary = build_share_text(result, template)
+            if summary and template.strip() and not self._is_qq_official(event):
+                # 只有官方 Bot 渲染 Markdown；其余平台把图片 / 链接换成真图片与纯文本
+                if chain := await self._markdown_chain(result, summary):
+                    yield event.chain_result(chain)
+            elif summary:
                 yield event.plain_result(summary)
 
         # 仅文本（或全部取消）不在交付链等待媒体。解析器已经启动的后台下载
@@ -1164,11 +1183,29 @@ class DeniaSharePlugin(Star):
         except Exception as e:
             logger.warning(f"解析卡片主动发送异常: {e}")
 
+    async def _markdown_chain(self, result: ParseResult, text: str) -> list:
+        """模板文本 → 消息链（OneBot / NapCat 不渲染 Markdown 图片标签）。
+
+        封面用解析时已下载的本地文件（B站封面下载带了平台请求头）；没下载成功就只发文字，
+        不让一张封面拖垮整条消息。
+        """
+        video = getattr(result, "video", None)
+        chain: list = []
+        for kind, value in split_markdown(text):
+            if kind == "text":
+                chain.append(Comp.Plain(value))
+            elif value == result.extra.get("cover") and video is not None and video.cover is not None:
+                if path := await video.cover.safe_get():
+                    chain.append(Comp.Image.fromFileSystem(str(path)))
+            else:
+                chain.append(Comp.Image.fromURL(value))
+        return chain
+
     async def _build_output(
         self, result: ParseResult, *, include_text: bool = True, include_media: bool = True,
     ) -> tuple[str, list[list]]:
         """构建一条精简文本与原始图片列表；图文中的正文不再重复发送。"""
-        summary = build_share_text(result) if include_text else ""
+        summary = build_share_text(result, get_config().TEXT_TEMPLATE) if include_text else ""
         nodes: list[list] = []
         if not include_media:
             return summary, nodes
@@ -1846,7 +1883,7 @@ class DeniaSharePlugin(Star):
         except Exception as e:
             logger.error(f"发送消息到 {session} 失败: {e}")
 
-    # ==================== JSON 卡片工具 ====================
+    # ==================== 分享卡片工具 ====================
 
     @staticmethod
     def _has_json_component(event: AstrMessageEvent) -> bool:
@@ -1860,18 +1897,30 @@ class DeniaSharePlugin(Star):
                 return True
         return False
 
+    def _official_card_input(self, event: AstrMessageEvent):
+        if not self._is_qq_official(event):
+            return None
+        return inspect_official_card(
+            getattr(event, "message_obj", None), event.message_str or "",
+        )
+
+    def _has_share_card(self, event: AstrMessageEvent) -> bool:
+        return self._has_json_component(event) or self._official_card_input(event) is not None
+
     def _extract_links_from_event(self, event: AstrMessageEvent) -> list[str]:
-        links: list[str] = []
+        official_card = self._official_card_input(event)
+        links: list[str] = list(official_card.links) if official_card is not None else []
         if hasattr(event, "message_obj") and hasattr(event.message_obj, "message"):
             for c in event.message_obj.message:
                 if isinstance(c, Comp.Json):
                     links.extend(self._extract_links_from_json(c.data))
-                elif isinstance(c, Comp.Plain):
+                elif isinstance(c, Comp.Plain) and official_card is None:
                     links.extend(URL_PATTERN.findall(c.text or ""))
                 elif isinstance(c, dict) and "json" in str(c.get("type", "")).lower():
                     links.extend(self._extract_links_from_json(c.get("data", c)))
-        links.extend(URL_PATTERN.findall(event.message_str or ""))
-        return links
+        if official_card is None:
+            links.extend(URL_PATTERN.findall(event.message_str or ""))
+        return list(dict.fromkeys(links))
 
     @staticmethod
     def _extract_links_from_json(data) -> list[str]:

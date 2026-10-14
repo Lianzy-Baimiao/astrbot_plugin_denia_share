@@ -839,10 +839,12 @@ export function createConfigView(ctx) {
     }
 
     if (item.type === "text") {
+      // textarea 的内容来自子文本，value 属性对它无效（之前只有 secret 项走不到这里）
       return h("textarea", {
         class: "input",
-        value: value === null || value === undefined ? "" : String(value),
-        rows: 3,
+        text: value === null || value === undefined ? "" : String(value),
+        rows: item.rows || 3,
+        placeholder: item.placeholder || "",
         spellcheck: "false",
         onInput: (event) => onValueChanged(item.key, event.target.value),
       });

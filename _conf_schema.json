@@ -337,6 +337,13 @@
         "invisible": true,
         "hint": "每条键=文本+卡片，可用 + 组合文本 / 卡片 / 富媒体，不发送=全部关闭；兼容旧模式名。卡片同样受卡片渲染开关控制。优先级 umo > 群号 > 平台名 > 全局。"
       },
+      "TEXT_TEMPLATE": {
+        "description": "文本模板（Markdown）",
+        "type": "text",
+        "default": "",
+        "invisible": true,
+        "hint": "留空=默认精简文本。占位符 {title} {url} {info} {warnings} {summary} {cover} {play_url} {platform} {author}；占位符全为空的行整行省略。官方 Bot 按 Markdown 渲染，NapCat 下图片换成真图片、链接换成纯文本。请在插件 WebUI 的配置页编辑。"
+      },
       "CACHE_DIR": {
         "description": "共享缓存目录",
         "type": "string",
